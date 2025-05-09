@@ -1,4 +1,4 @@
-# your_package/segmentation.py
+# Version 1.0
 
 import os
 import json
@@ -8,7 +8,7 @@ import torch.optim as optim
 from pathlib import Path
 import numpy as np
 
-from monai.data import CacheDataset, DataLoader, NibabelReader
+from monai.data import CacheDataset, DataLoader, NibabelReader, pad_list_data_collate
 from monai.transforms import (
     LoadImaged,
     EnsureChannelFirstd,
@@ -20,7 +20,8 @@ from monai.transforms import (
     RandFlipd,
     RandRotate90d,
     Lambdad,
-    ToTensord
+    ToTensord,
+    SpatialPadd     
 )
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric, HausdorffDistanceMetric
@@ -322,67 +323,133 @@ class UNetSeg:
         self, nnunet_raw: str, task_id: str,
         batch_size: int = 1, num_workers: int = 4
     ) -> dict:
+        import numpy as np
+        from monai.data import pad_list_data_collate
+    
         ds   = Path(nnunet_raw) / f"Dataset{task_id}"
         info = json.load(open(ds/"dataset.json"))
         test_list = info.get("test", info.get("testing", []))
-
+    
         test_transforms = [
             LoadImaged(keys=["images","label"], reader=NibabelReader()),
             EnsureChannelFirstd(keys=["images","label"]),
             Spacingd(keys=["images","label"], pixdim=(1,1,1), mode=("bilinear","nearest")),
             Orientationd(keys=["images","label"], axcodes="RAS"),
-            Lambdad(keys="label", func=RemapLabels({int(k):i for i,k in enumerate(sorted(info['labels'].keys(),key=int))})),
-            ScaleIntensityRanged(keys=["images"], a_min=0, a_max=3000, b_min=0.0, b_max=1.0, clip=True),
+            Lambdad(
+                keys="label",
+                func=RemapLabels({int(k): i for i, k in enumerate(sorted(info["labels"].keys(), key=int))})
+            ),
+            ScaleIntensityRanged(
+                keys=["images"], a_min=0, a_max=3000, b_min=0.0, b_max=1.0, clip=True
+            ),
             CropForegroundd(keys=["images","label"], source_key="images"),
-            ToTensord(keys=["images","label"])
+            ToTensord(keys=["images","label"]),
         ]
-
-        data_list = [{
-            "images": [str(ds/"imagesTs"/fn) for fn in ex["image"]],
-            "label":  str(ds/"labelsTs"/ex["label"])
-        } for ex in test_list]
-
+    
+        data_list = [
+            {
+                "images": [str(ds/"imagesTs"/fn) for fn in ex["image"]],
+                "label":  str(ds/"labelsTs"/ex["label"])
+            }
+            for ex in test_list
+        ]
+    
         loader = DataLoader(
             CacheDataset(data=data_list, transform=test_transforms, cache_rate=0.0),
-            batch_size=batch_size, shuffle=False,
+            batch_size=batch_size,
+            shuffle=False,
             num_workers=num_workers,
-            pin_memory=torch.cuda.is_available()
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=pad_list_data_collate,
         )
-
-        self.test_dice_metric.reset()
-        self.test_hd95_metric.reset()
+    
+        # Metric holders
+        per_case_dice = []
+        per_case_hd95 = []
+        per_case_sens = []
+        per_case_spec = []
+    
         tp = tn = fp = fn = 0
-
+        self.test_hd95_metric.reset()
         self.model.eval()
         with torch.no_grad():
             for batch in loader:
-                imgs = [m.unsqueeze(1).to(self.device) for m in torch.unbind(batch['images'], dim=1)]
-                lbl  = batch['label'].to(self.device)
+                imgs = [
+                    m.unsqueeze(1).to(self.device)
+                    for m in torch.unbind(batch["images"], dim=1)
+                ]
+                lbl = batch["label"].to(self.device)
                 preds = self.model(imgs)
                 pred_lbl = torch.argmax(preds, dim=1)
-
-                # 混淆矩阵计数
+    
+                # 二分类混淆矩阵统计
                 y_pred_bin = (pred_lbl > 0)
                 y_true_bin = (lbl > 0)
                 tp += int((y_pred_bin &  y_true_bin).sum())
                 tn += int((~y_pred_bin & ~y_true_bin).sum())
                 fp += int((y_pred_bin & ~y_true_bin).sum())
                 fn += int((~y_pred_bin &  y_true_bin).sum())
-
-                # 计算 DSC & HD95
+    
+                # Dice
                 pred_oh = one_hot(pred_lbl.unsqueeze(1), preds.shape[1])
                 true_oh = one_hot(lbl, preds.shape[1])
+                self.test_dice_metric.reset()
                 self.test_dice_metric(y_pred=pred_oh, y=true_oh)
+                dice_val = self.test_dice_metric.aggregate().item()
+                per_case_dice.extend([dice_val] * batch_size)
+    
+                # HD95
                 self.test_hd95_metric(y_pred=pred_oh, y=true_oh)
-
-        mean_dice = self.test_dice_metric.aggregate().item()
-        mean_hd95 = self.test_hd95_metric.aggregate().item()
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-
+                hd95_val = self.test_hd95_metric.aggregate().item()
+                per_case_hd95.extend([hd95_val] * batch_size)
+                self.test_hd95_metric.reset()
+    
+                # Sensitivity & Specificity
+                sens_val = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                spec_val = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+                per_case_sens.extend([sens_val] * batch_size)
+                per_case_spec.extend([spec_val] * batch_size)
+    
+        # 计算平均
+        mean_dice = float(np.mean(per_case_dice))
+        mean_hd95 = float(np.mean(per_case_hd95))
+        mean_sens = float(np.mean(per_case_sens))
+        mean_spec = float(np.mean(per_case_spec))
+    
+        # Bootstrap 方差 & 95% CI 函数
+        def _bootstrap_variance(values, n_bootstraps=1000, seed=42):
+            rng = np.random.default_rng(seed)
+            n = len(values)
+            means = [rng.choice(values, size=n, replace=True).mean() for _ in range(n_bootstraps)]
+            var = float(np.var(means, ddof=1))
+            ci_low, ci_high = np.percentile(means, [2.5, 97.5])
+            return var, float(ci_low), float(ci_high)
+    
+        var_dice, ci_dice_l, ci_dice_u = _bootstrap_variance(per_case_dice)
+        var_hd95, ci_hd95_l, ci_hd95_u = _bootstrap_variance(per_case_hd95)
+        var_sens, ci_sens_l, ci_sens_u = _bootstrap_variance(per_case_sens)
+        var_spec, ci_spec_l, ci_spec_u = _bootstrap_variance(per_case_spec)
+    
+        print(f"Dice = {mean_dice:.4f} ± {var_dice:.6f} (95% CI [{ci_dice_l:.3f}, {ci_dice_u:.3f}])")
+        print(f"HD95 = {mean_hd95:.2f} ± {var_hd95:.4f} (95% CI [{ci_hd95_l:.2f}, {ci_hd95_u:.2f}])")
+        print(f"Sensitivity = {mean_sens:.4f} ± {var_sens:.6f} (95% CI [{ci_sens_l:.3f}, {ci_sens_u:.3f}])")
+        print(f"Specificity = {mean_spec:.4f} ± {var_spec:.6f} (95% CI [{ci_spec_l:.3f}, {ci_spec_u:.3f}])")
+    
         return {
             "dice": mean_dice,
+            "dice_var": var_dice,
+            "dice_ci_lower": ci_dice_l,
+            "dice_ci_upper": ci_dice_u,
             "hd95": mean_hd95,
-            "sensitivity": sensitivity,
-            "specificity": specificity
+            "hd95_var": var_hd95,
+            "hd95_ci_lower": ci_hd95_l,
+            "hd95_ci_upper": ci_hd95_u,
+            "sensitivity": mean_sens,
+            "sens_var": var_sens,
+            "sens_ci_lower": ci_sens_l,
+            "sens_ci_upper": ci_sens_u,
+            "specificity": mean_spec,
+            "spec_var": var_spec,
+            "spec_ci_lower": ci_spec_l,
+            "spec_ci_upper": ci_spec_u,
         }
