@@ -1,5 +1,4 @@
-# Version 1.0
-
+# Version 2.0: 增强、Dropout、网络加宽
 import os
 import json
 import torch
@@ -19,15 +18,16 @@ from monai.transforms import (
     RandCropByPosNegLabeld,
     RandFlipd,
     RandRotate90d,
+    RandZoomd,
+    RandGaussianNoised,
+    RandShiftIntensityd,
     Lambdad,
     ToTensord,
-    SpatialPadd     
 )
 from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric, HausdorffDistanceMetric
 from monai.networks.blocks import Convolution, UpSample
 from monai.networks.utils import one_hot
-
 
 class RemapLabels:
     def __init__(self, label_map: dict):
@@ -38,7 +38,6 @@ class RemapLabels:
         for orig_val, new_val in self.label_map.items():
             out[x == orig_val] = new_val
         return out
-
 
 def center_crop(src: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     src_shape = src.shape[2:]
@@ -53,7 +52,6 @@ def center_crop(src: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         crops[2]:crops[2] + tgt_shape[2],
     ]
 
-
 class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
     def __init__(
         self,
@@ -61,10 +59,11 @@ class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
         in_channels=1,
         out_channels=2,
         num_images=4,
-        base_channels=16,
+        base_channels=24,
         num_levels=4,
         channel_multipliers=None,
-        up_mode="deconv"
+        up_mode="deconv",
+        dropout_prob=0.2,
     ):
         super().__init__()
         if channel_multipliers is None:
@@ -74,17 +73,20 @@ class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
         self.channels = [base_channels * m for m in channel_multipliers]
         self.num_levels = num_levels
         self.num_images = num_images
+        self.dropout = nn.Dropout3d(p=dropout_prob)
 
         # encoders
         self.image_encoders = nn.ModuleList()
         for _ in range(num_images):
             layers = []
+            # 首层
             layers.append(Convolution(
                 spatial_dims, in_channels, self.channels[0],
                 strides=1, kernel_size=3,
                 act=("RELU", {"inplace": True}),
                 norm=("GROUP", {"num_groups": 8}),
             ))
+            # 后续级别
             for i in range(1, num_levels):
                 layers.append(Convolution(
                     spatial_dims, self.channels[i-1], self.channels[i],
@@ -156,6 +158,7 @@ class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
 
         x = torch.cat(feats, dim=1)
         x = self.bottleneck(x)
+        x = self.dropout(x)
 
         for i in range(self.num_levels - 1):
             x = self.upsamples[i](x)
@@ -169,9 +172,9 @@ class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
                         x = center_crop(x, skip)
                 skips.append(skip)
             x = self.decoders[i](torch.cat([x, *skips], dim=1))
+            x = self.dropout(x)
 
         return self.final_conv(x)
-
 
 class UNetSeg:
     def __init__(self, save_dir: str, lr: float = 1e-4, val_split: float = 0.2):
@@ -181,11 +184,9 @@ class UNetSeg:
         self.lr = lr
         self.val_split = val_split
 
-        # 损失与优化
         self.loss_fn = None
         self.optimizer = None
 
-        # 指标
         self.train_metric     = DiceMetric(include_background=False, reduction="mean")
         self.val_metric       = DiceMetric(include_background=False, reduction="mean")
         self.hd95_metric      = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
@@ -196,10 +197,13 @@ class UNetSeg:
 
     def _build_model(self, num_images: int, num_classes: int):
         self.model = FlexibleMONAI_UNet_MultiImage_SingleDecoder(
-            spatial_dims=3, in_channels=1,
+            spatial_dims=3,
+            in_channels=1,
             out_channels=num_classes,
             num_images=num_images,
-            base_channels=16, num_levels=4,
+            base_channels=24,
+            num_levels=4,
+            dropout_prob=0.2,
         ).to(self.device)
         self.loss_fn  = DiceCELoss(to_onehot_y=True, softmax=True)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
@@ -223,12 +227,10 @@ class UNetSeg:
         cache_rate: float = 0.2,
         num_workers: int = 4
     ):
-        # 加载 dataset.json
         ds   = Path(nnunet_raw) / f"Dataset{task_id}"
         info = json.load(open(ds / "dataset.json"))
         ex_list = info["training"]
 
-        # 划分训练/验证集
         split_idx = int(len(ex_list) * (1 - self.val_split))
         train_exs = ex_list[:split_idx]
         val_exs   = ex_list[split_idx:]
@@ -251,10 +253,12 @@ class UNetSeg:
                 Lambdad(keys="label", func=RemapLabels(label_map)),
                 ScaleIntensityRanged(keys=["images"], a_min=0, a_max=3000, b_min=0.0, b_max=1.0, clip=True),
                 CropForegroundd(keys=["images","label"], source_key="images"),
-                RandCropByPosNegLabeld(keys=["images","label"], label_key="label",
-                                       spatial_size=(64,64,64), pos=1, neg=1, num_samples=4),
-                RandFlipd(keys=["images","label"], spatial_axis=[0], prob=0.5),
+                RandCropByPosNegLabeld(keys=["images","label"], label_key="label", spatial_size=(64,64,64), pos=1, neg=1, num_samples=4),
+                RandFlipd(keys=["images","label"], prob=0.5, spatial_axis=[0]),
                 RandRotate90d(keys=["images","label"], prob=0.5, max_k=3),
+                RandZoomd(keys=["images","label"], prob=0.3, min_zoom=0.9, max_zoom=1.1),
+                RandGaussianNoised(keys=["images"], prob=0.2, mean=0.0, std=0.1),
+                RandShiftIntensityd(keys=["images"], prob=0.2, offsets=0.10),
                 ToTensord(keys=["images","label"]),
             ]
             ds_obj = CacheDataset(data=data, transform=transforms, cache_rate=cache_rate)
@@ -302,7 +306,6 @@ class UNetSeg:
 
         print(f"Training complete. Best val Dice: {best_val_dice:.4f}")
 
-        # 训练结束后，盲测测试集
         final_metrics = self.evaluate_from_nnunet(nnunet_raw, task_id, batch_size, num_workers)
         print(
             f"Final Test → "
@@ -325,11 +328,11 @@ class UNetSeg:
     ) -> dict:
         import numpy as np
         from monai.data import pad_list_data_collate
-    
+
         ds   = Path(nnunet_raw) / f"Dataset{task_id}"
         info = json.load(open(ds/"dataset.json"))
         test_list = info.get("test", info.get("testing", []))
-    
+
         test_transforms = [
             LoadImaged(keys=["images","label"], reader=NibabelReader()),
             EnsureChannelFirstd(keys=["images","label"]),
@@ -345,7 +348,7 @@ class UNetSeg:
             CropForegroundd(keys=["images","label"], source_key="images"),
             ToTensord(keys=["images","label"]),
         ]
-    
+
         data_list = [
             {
                 "images": [str(ds/"imagesTs"/fn) for fn in ex["image"]],
@@ -353,7 +356,7 @@ class UNetSeg:
             }
             for ex in test_list
         ]
-    
+
         loader = DataLoader(
             CacheDataset(data=data_list, transform=test_transforms, cache_rate=0.0),
             batch_size=batch_size,
@@ -362,94 +365,44 @@ class UNetSeg:
             pin_memory=torch.cuda.is_available(),
             collate_fn=pad_list_data_collate,
         )
-    
-        # Metric holders
-        per_case_dice = []
-        per_case_hd95 = []
-        per_case_sens = []
-        per_case_spec = []
-    
+
+        per_case_dice, per_case_hd95 = [], []
         tp = tn = fp = fn = 0
         self.test_hd95_metric.reset()
         self.model.eval()
         with torch.no_grad():
             for batch in loader:
-                imgs = [
-                    m.unsqueeze(1).to(self.device)
-                    for m in torch.unbind(batch["images"], dim=1)
-                ]
+                imgs = [m.unsqueeze(1).to(self.device)
+                        for m in torch.unbind(batch["images"], dim=1)]
                 lbl = batch["label"].to(self.device)
                 preds = self.model(imgs)
                 pred_lbl = torch.argmax(preds, dim=1)
-    
-                # 二分类混淆矩阵统计
+
                 y_pred_bin = (pred_lbl > 0)
                 y_true_bin = (lbl > 0)
-                tp += int((y_pred_bin &  y_true_bin).sum())
+                tp += int((y_pred_bin & y_true_bin).sum())
                 tn += int((~y_pred_bin & ~y_true_bin).sum())
                 fp += int((y_pred_bin & ~y_true_bin).sum())
-                fn += int((~y_pred_bin &  y_true_bin).sum())
-    
-                # Dice
+                fn += int((~y_pred_bin & y_true_bin).sum())
+
                 pred_oh = one_hot(pred_lbl.unsqueeze(1), preds.shape[1])
                 true_oh = one_hot(lbl, preds.shape[1])
                 self.test_dice_metric.reset()
                 self.test_dice_metric(y_pred=pred_oh, y=true_oh)
-                dice_val = self.test_dice_metric.aggregate().item()
-                per_case_dice.extend([dice_val] * batch_size)
-    
-                # HD95
+                per_case_dice.extend([self.test_dice_metric.aggregate().item()]*batch_size)
+
                 self.test_hd95_metric(y_pred=pred_oh, y=true_oh)
-                hd95_val = self.test_hd95_metric.aggregate().item()
-                per_case_hd95.extend([hd95_val] * batch_size)
+                per_case_hd95.extend([self.test_hd95_metric.aggregate().item()]*batch_size)
                 self.test_hd95_metric.reset()
-    
-                # Sensitivity & Specificity
-                sens_val = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-                spec_val = tn / (tn + fp) if (tn + fp) > 0 else 0.0
-                per_case_sens.extend([sens_val] * batch_size)
-                per_case_spec.extend([spec_val] * batch_size)
-    
-        # 计算平均
+
         mean_dice = float(np.mean(per_case_dice))
         mean_hd95 = float(np.mean(per_case_hd95))
-        mean_sens = float(np.mean(per_case_sens))
-        mean_spec = float(np.mean(per_case_spec))
-    
-        # Bootstrap 方差 & 95% CI 函数
-        def _bootstrap_variance(values, n_bootstraps=1000, seed=42):
-            rng = np.random.default_rng(seed)
-            n = len(values)
-            means = [rng.choice(values, size=n, replace=True).mean() for _ in range(n_bootstraps)]
-            var = float(np.var(means, ddof=1))
-            ci_low, ci_high = np.percentile(means, [2.5, 97.5])
-            return var, float(ci_low), float(ci_high)
-    
-        var_dice, ci_dice_l, ci_dice_u = _bootstrap_variance(per_case_dice)
-        var_hd95, ci_hd95_l, ci_hd95_u = _bootstrap_variance(per_case_hd95)
-        var_sens, ci_sens_l, ci_sens_u = _bootstrap_variance(per_case_sens)
-        var_spec, ci_spec_l, ci_spec_u = _bootstrap_variance(per_case_spec)
-    
-        print(f"Dice = {mean_dice:.4f} ± {var_dice:.6f} (95% CI [{ci_dice_l:.3f}, {ci_dice_u:.3f}])")
-        print(f"HD95 = {mean_hd95:.2f} ± {var_hd95:.4f} (95% CI [{ci_hd95_l:.2f}, {ci_hd95_u:.2f}])")
-        print(f"Sensitivity = {mean_sens:.4f} ± {var_sens:.6f} (95% CI [{ci_sens_l:.3f}, {ci_sens_u:.3f}])")
-        print(f"Specificity = {mean_spec:.4f} ± {var_spec:.6f} (95% CI [{ci_spec_l:.3f}, {ci_spec_u:.3f}])")
-    
+        mean_sens = tp / (tp + fn) if (tp + fn) else 0.0
+        mean_spec = tn / (tn + fp) if (tn + fp) else 0.0
+
         return {
             "dice": mean_dice,
-            "dice_var": var_dice,
-            "dice_ci_lower": ci_dice_l,
-            "dice_ci_upper": ci_dice_u,
             "hd95": mean_hd95,
-            "hd95_var": var_hd95,
-            "hd95_ci_lower": ci_hd95_l,
-            "hd95_ci_upper": ci_hd95_u,
             "sensitivity": mean_sens,
-            "sens_var": var_sens,
-            "sens_ci_lower": ci_sens_l,
-            "sens_ci_upper": ci_sens_u,
             "specificity": mean_spec,
-            "spec_var": var_spec,
-            "spec_ci_lower": ci_spec_l,
-            "spec_ci_upper": ci_spec_u,
         }
