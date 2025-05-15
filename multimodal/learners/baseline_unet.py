@@ -12,13 +12,26 @@ from monai.transforms import (
     ScaleIntensityRanged, Lambdad, DivisiblePadd, ToTensord
 )
 from monai.networks.nets import UNet
-from monai.losses import DiceLoss
+from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric, HausdorffDistanceMetric
 from monai.inferers import sliding_window_inference
 from monai.networks.utils import one_hot
 
 # 1. cuDNN 自动调优
 torch.backends.cudnn.benchmark = True
+
+class UNetWithDropout(UNet):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # insert dropout after each Conv block in the bottleneck
+        self.bottleneck_dropout = nn.Dropout3d(p=0.2)
+
+    def forward(self, x):
+        # run through UNet as usual
+        x = super().forward(x)
+        # apply dropout on the deepest features
+        x = self.bottleneck_dropout(x)
+        return x
 
 class BaselineUNetSegmenter:
     def __init__(self, save_dir: str, lr: float = 1e-4,
@@ -37,7 +50,7 @@ class BaselineUNetSegmenter:
         # model, optimizer, loss, metrics
         self.model = None
         self.optimizer = None
-        self.loss_fn = DiceLoss(to_onehot_y=True, softmax=True)
+        self.loss_fn = DiceCELoss(to_onehot_y=True, softmax=True)
         self.val_metric = DiceMetric(include_background=False, reduction="mean")
         # test metrics
         self.test_dice_metric = DiceMetric(include_background=False, reduction="mean")
@@ -46,16 +59,16 @@ class BaselineUNetSegmenter:
         )
 
     def _build_model(self):
-        self.model = UNet(
+        self.model = UNetWithDropout(
             spatial_dims=3,
             in_channels=self.in_channels,
             out_channels=self.num_classes,
-            channels=(16, 32, 64, 128),
+            channels=(32, 64, 128, 256),
             strides=(2, 2, 2),
-            num_res_units=2
+            num_res_units=2,
+            norm="instance"   # GroupNorm baked into each conv block
         ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
-        # AMP scaler
         self.scaler = torch.cuda.amp.GradScaler()
 
     def _get_dataloader(self, data_list, batch_size, shuffle, num_workers):
