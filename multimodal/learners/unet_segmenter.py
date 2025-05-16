@@ -1,4 +1,4 @@
-# Version 2.0: 增强、Dropout、网络加宽
+# v3
 import os
 import json
 import torch
@@ -28,6 +28,20 @@ from monai.losses import DiceCELoss
 from monai.metrics import DiceMetric, HausdorffDistanceMetric
 from monai.networks.blocks import Convolution, UpSample
 from monai.networks.utils import one_hot
+from monai.inferers import sliding_window_inference
+
+
+def center_crop(src: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    src_shape = src.shape[2:]
+    tgt_shape = target.shape[2:]
+    diffs = [s - t for s, t in zip(src_shape, tgt_shape)]
+    crops = [d // 2 for d in diffs]
+    return src[
+        :, :,
+        crops[0]:crops[0] + tgt_shape[0],
+        crops[1]:crops[1] + tgt_shape[1],
+        crops[2]:crops[2] + tgt_shape[2],
+    ]
 
 class RemapLabels:
     def __init__(self, label_map: dict):
@@ -38,19 +52,6 @@ class RemapLabels:
         for orig_val, new_val in self.label_map.items():
             out[x == orig_val] = new_val
         return out
-
-def center_crop(src: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    src_shape = src.shape[2:]
-    tgt_shape = target.shape[2:]
-    diffs = [s - t for s, t in zip(src_shape, tgt_shape)]
-    crops = [d // 2 for d in diffs]
-    return src[
-        :,
-        :,
-        crops[0]:crops[0] + tgt_shape[0],
-        crops[1]:crops[1] + tgt_shape[1],
-        crops[2]:crops[2] + tgt_shape[2],
-    ]
 
 class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
     def __init__(
@@ -68,25 +69,21 @@ class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
         super().__init__()
         if channel_multipliers is None:
             channel_multipliers = [1, 2, 4, 8, 16]
-        assert len(channel_multipliers) == num_levels + 1
-
         self.channels = [base_channels * m for m in channel_multipliers]
         self.num_levels = num_levels
         self.num_images = num_images
         self.dropout = nn.Dropout3d(p=dropout_prob)
 
-        # encoders
+        # encoders per modality
         self.image_encoders = nn.ModuleList()
         for _ in range(num_images):
             layers = []
-            # 首层
             layers.append(Convolution(
                 spatial_dims, in_channels, self.channels[0],
                 strides=1, kernel_size=3,
                 act=("RELU", {"inplace": True}),
                 norm=("GROUP", {"num_groups": 8}),
             ))
-            # 后续级别
             for i in range(1, num_levels):
                 layers.append(Convolution(
                     spatial_dims, self.channels[i-1], self.channels[i],
@@ -102,18 +99,17 @@ class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
                 ))
             self.image_encoders.append(nn.ModuleList(layers))
 
-        # bottleneck
+        # bottleneck merging all modalities
         self.bottleneck = Convolution(
             spatial_dims,
             self.channels[num_levels - 1] * num_images,
             self.channels[-1],
-            strides=1,
-            kernel_size=3,
+            strides=1, kernel_size=3,
             act=("RELU", {"inplace": True}),
             norm=("GROUP", {"num_groups": 8}),
         )
 
-        # decoder
+        # decoder path
         self.upsamples = nn.ModuleList()
         self.decoders = nn.ModuleList()
         for i in range(num_levels - 1):
@@ -132,7 +128,6 @@ class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
                 norm=("GROUP", {"num_groups": 8}),
             ))
 
-        # final conv
         self.final_conv = Convolution(
             spatial_dims,
             in_channels=self.channels[0],
@@ -148,8 +143,7 @@ class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
             out = branch[0](x)
             skip_feats.append(out)
             idx = 1
-            num_blocks = (len(branch) - 1) // 2
-            for _ in range(num_blocks):
+            for _ in range((len(branch) - 1) // 2):
                 out = branch[idx](out); idx += 1
                 out = branch[idx](out); idx += 1
                 skip_feats.append(out)
@@ -171,7 +165,7 @@ class FlexibleMONAI_UNet_MultiImage_SingleDecoder(nn.Module):
                     else:
                         x = center_crop(x, skip)
                 skips.append(skip)
-            x = self.decoders[i](torch.cat([x, *skips], dim=1))
+            x = self.decoders[i](torch.cat([x] + skips, dim=1))
             x = self.dropout(x)
 
         return self.final_conv(x)
@@ -184,9 +178,7 @@ class UNetSeg:
         self.lr = lr
         self.val_split = val_split
 
-        self.loss_fn = None
-        self.optimizer = None
-
+        # metrics
         self.train_metric     = DiceMetric(include_background=False, reduction="mean")
         self.val_metric       = DiceMetric(include_background=False, reduction="mean")
         self.hd95_metric      = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
@@ -194,215 +186,213 @@ class UNetSeg:
         self.test_hd95_metric = HausdorffDistanceMetric(include_background=False, percentile=95, reduction="mean")
 
         self.model = None
+        self.loss_fn = None
+        self.optimizer = None
+        self.num_classes = 0
 
     def _build_model(self, num_images: int, num_classes: int):
         self.model = FlexibleMONAI_UNet_MultiImage_SingleDecoder(
-            spatial_dims=3,
-            in_channels=1,
-            out_channels=num_classes,
-            num_images=num_images,
-            base_channels=24,
-            num_levels=4,
-            dropout_prob=0.2,
+            spatial_dims=3, in_channels=1,
+            out_channels=num_classes, num_images=num_images,
+            base_channels=24, num_levels=4, dropout_prob=0.2
         ).to(self.device)
-        self.loss_fn  = DiceCELoss(to_onehot_y=True, softmax=True)
+        self.loss_fn   = DiceCELoss(to_onehot_y=True, softmax=True)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.num_classes = num_classes
 
-    def load(self, checkpoint_path: str, nnunet_raw: str = None, task_id: str = None):
-        if self.model is None:
-            assert nnunet_raw and task_id, "首次 load 需提供 nnunet_raw 和 task_id"
-            ds   = Path(nnunet_raw) / f"Dataset{task_id}"
-            info = json.load(open(ds / "dataset.json"))
-            num_images  = len(info["modality"])
-            num_classes = len(info["labels"])
-            self._build_model(num_images, num_classes)
-        self.model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+    def sw_infer(self, inputs_list: list[torch.Tensor]) -> torch.Tensor:
+        """
+        Sliding-window inference for multi-modality inputs.
+        inputs_list: list of tensors [B,1,D,H,W]
+        returns: logits [B, C, D, H, W]
+        """
+        # combine modalities into one tensor along channel dim
+        vol = torch.cat(inputs_list, dim=1)
+        # predictor splits back into modality list and adds channel dim
+        def _predict(x):
+            # x: Tensor [B, C, D, H, W]
+            x_list = [xi.unsqueeze(1) for xi in torch.unbind(x, dim=1)]
+            return self.model(x_list)
+        return sliding_window_inference(
+            vol,
+            roi_size=(64,64,64),
+            sw_batch_size=1,
+            predictor=_predict,
+            overlap=0.5,
+        )
 
-    def fit_from_nnunet(
-        self,
-        nnunet_raw: str,
-        task_id: str,
-        epochs: int = 50,
-        batch_size: int = 1,
-        cache_rate: float = 0.2,
-        num_workers: int = 4
-    ):
-        ds   = Path(nnunet_raw) / f"Dataset{task_id}"
-        info = json.load(open(ds / "dataset.json"))
-        ex_list = info["training"]
-
-        split_idx = int(len(ex_list) * (1 - self.val_split))
-        train_exs = ex_list[:split_idx]
-        val_exs   = ex_list[split_idx:]
+    def fit_from_nnunet(self, nnunet_raw: str, task_id: str,
+                        epochs: int = 50, batch_size: int = 1,
+                        cache_rate: float = 0.2, num_workers: int = 4):
+        # prepare dataset split
+        ds = Path(nnunet_raw)/f"Dataset{task_id}"
+        info = json.load(open(ds/"dataset.json"))
+        exs = info["training"]
+        split_idx = int(len(exs)*(1-self.val_split))
+        train_exs, val_exs = exs[:split_idx], exs[split_idx:]
 
         modalities = sorted(info["modality"].keys(), key=int)
-        labels     = sorted(info["labels"].keys(), key=int)
-        label_map  = {int(o): i for i, o in enumerate(labels)}
+        labels = sorted(info["labels"].keys(), key=int)
         self._build_model(len(modalities), len(labels))
 
-        def make_loader(exs, shuffle):
+        def make_loader(ex_list, shuffle):
             data = [{
                 "images": [str(ds/"imagesTr"/fn) for fn in ex["image"]],
                 "label":  str(ds/"labelsTr"/ex["label"])
-            } for ex in exs]
+            } for ex in ex_list]
             transforms = [
                 LoadImaged(keys=["images","label"], reader=NibabelReader()),
                 EnsureChannelFirstd(keys=["images","label"]),
                 Spacingd(keys=["images","label"], pixdim=(1,1,1), mode=("bilinear","nearest")),
                 Orientationd(keys=["images","label"], axcodes="RAS"),
-                Lambdad(keys="label", func=RemapLabels(label_map)),
+                Lambdad(keys="label", func=RemapLabels({int(k):i for i,k in enumerate(labels)})),
                 ScaleIntensityRanged(keys=["images"], a_min=0, a_max=3000, b_min=0.0, b_max=1.0, clip=True),
                 CropForegroundd(keys=["images","label"], source_key="images"),
                 RandCropByPosNegLabeld(keys=["images","label"], label_key="label", spatial_size=(64,64,64), pos=1, neg=1, num_samples=4),
                 RandFlipd(keys=["images","label"], prob=0.5, spatial_axis=[0]),
                 RandRotate90d(keys=["images","label"], prob=0.5, max_k=3),
-                RandZoomd(keys=["images","label"], prob=0.3, min_zoom=0.9, max_zoom=1.1),
+                RandZoomd(keys=["images"], prob=0.3, min_zoom=0.9, max_zoom=1.1),
                 RandGaussianNoised(keys=["images"], prob=0.2, mean=0.0, std=0.1),
                 RandShiftIntensityd(keys=["images"], prob=0.2, offsets=0.10),
-                ToTensord(keys=["images","label"]),
+                ToTensord(keys=["images","label"], dtype=torch.float32),
             ]
             ds_obj = CacheDataset(data=data, transform=transforms, cache_rate=cache_rate)
             return DataLoader(ds_obj, batch_size=batch_size, shuffle=shuffle,
-                              num_workers=num_workers,
-                              pin_memory=torch.cuda.is_available())
+                              num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                              collate_fn=pad_list_data_collate)
 
-        train_loader = make_loader(train_exs, shuffle=True)
-        val_loader   = make_loader(val_exs,   shuffle=False)
+        train_loader = make_loader(train_exs, True)
+        val_loader   = make_loader(val_exs, False)
 
-        best_val_dice = 0.0
+        best_dice = 0.0
         for ep in range(1, epochs+1):
-            # 训练
+            # training
             self.model.train()
             total_loss = 0.0
             for batch in train_loader:
                 imgs = [m.unsqueeze(1).to(self.device) for m in torch.unbind(batch['images'], dim=1)]
-                lbl  = batch['label'].to(self.device)
+                lbl = batch['label'].to(self.device)
                 self.optimizer.zero_grad()
                 preds = self.model(imgs)
-                loss  = self.loss_fn(preds, lbl)
+                loss = self.loss_fn(preds, lbl)
                 loss.backward()
                 self.optimizer.step()
                 total_loss += loss.item()
 
-            # 验证
+            # validation with sliding window
             self.model.eval()
             self.val_metric.reset()
             with torch.no_grad():
                 for batch in val_loader:
                     imgs = [m.unsqueeze(1).to(self.device) for m in torch.unbind(batch['images'], dim=1)]
-                    lbl  = batch['label'].to(self.device)
-                    preds = self.model(imgs)
+                    preds = self.sw_infer(imgs)
                     pred_lbl = torch.argmax(preds, dim=1)
-                    pred_oh  = one_hot(pred_lbl.unsqueeze(1), preds.shape[1])
-                    true_oh  = one_hot(lbl.unsqueeze(1), preds.shape[1])
-                    self.val_metric(y_pred=pred_oh, y=true_oh)
+                    self.val_metric(
+                        y_pred=one_hot(pred_lbl.unsqueeze(1), self.num_classes),
+                        y=one_hot(batch['label'].unsqueeze(1).to(self.device), self.num_classes)
+                    )
             val_dice = self.val_metric.aggregate().item()
             self.val_metric.reset()
-
             print(f"Epoch {ep}/{epochs} - train_loss: {total_loss/len(train_loader):.4f}, val_dice: {val_dice:.4f}")
-            if val_dice > best_val_dice:
-                best_val_dice = val_dice
+            if val_dice > best_dice:
+                best_dice = val_dice
                 torch.save(self.model.state_dict(), str(self.save_dir/"best_model.pt"))
+        print(f"Training complete. Best val Dice: {best_dice:.4f}")
 
-        print(f"Training complete. Best val Dice: {best_val_dice:.4f}")
-
-        final_metrics = self.evaluate_from_nnunet(nnunet_raw, task_id, batch_size, num_workers)
-        print(
-            f"Final Test → "
-            f"DSC: {final_metrics['dice']:.4f}, "
-            f"HD95: {final_metrics['hd95']:.4f}, "
-            f"Sensitivity: {final_metrics['sensitivity']:.4f}, "
-            f"Specificity: {final_metrics['specificity']:.4f}"
-        )
-
-    def predict(self, x_list: list[torch.Tensor]) -> torch.Tensor:
-        if self.model is None:
-            raise RuntimeError("Model not initialized. Call load() or fit_from_nnunet() first.")
-        self.model.eval()
-        with torch.no_grad():
-            return self.model([x.to(self.device) for x in x_list])
-
-    def evaluate_from_nnunet(
-        self, nnunet_raw: str, task_id: str,
-        batch_size: int = 1, num_workers: int = 4
-    ) -> dict:
-        import numpy as np
-        from monai.data import pad_list_data_collate
-
-        ds   = Path(nnunet_raw) / f"Dataset{task_id}"
+    def evaluate_from_nnunet(self, nnunet_raw: str, task_id: str,
+                             batch_size: int = 1, num_workers: int = 4) -> dict:
+        ds = Path(nnunet_raw)/f"Dataset{task_id}"
         info = json.load(open(ds/"dataset.json"))
-        test_list = info.get("test", info.get("testing", []))
+        test_exs = info.get("test", info.get("testing", []))
 
-        test_transforms = [
+        transforms = [
             LoadImaged(keys=["images","label"], reader=NibabelReader()),
             EnsureChannelFirstd(keys=["images","label"]),
             Spacingd(keys=["images","label"], pixdim=(1,1,1), mode=("bilinear","nearest")),
             Orientationd(keys=["images","label"], axcodes="RAS"),
-            Lambdad(
-                keys="label",
-                func=RemapLabels({int(k): i for i, k in enumerate(sorted(info["labels"].keys(), key=int))})
-            ),
-            ScaleIntensityRanged(
-                keys=["images"], a_min=0, a_max=3000, b_min=0.0, b_max=1.0, clip=True
-            ),
-            CropForegroundd(keys=["images","label"], source_key="images"),
-            ToTensord(keys=["images","label"]),
+            Lambdad(keys="label", func=RemapLabels({int(k):i for i,k in enumerate(sorted(info["labels"].keys(), key=int))})),
+            ScaleIntensityRanged(keys=["images"], a_min=0, a_max=3000, b_min=0.0, b_max=1.0, clip=True),
+            ToTensord(keys=["images","label"], dtype=torch.float32),
         ]
-
-        data_list = [
-            {
-                "images": [str(ds/"imagesTs"/fn) for fn in ex["image"]],
-                "label":  str(ds/"labelsTs"/ex["label"])
-            }
-            for ex in test_list
-        ]
-
-        loader = DataLoader(
-            CacheDataset(data=data_list, transform=test_transforms, cache_rate=0.0),
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=torch.cuda.is_available(),
-            collate_fn=pad_list_data_collate,
-        )
+        data = [{
+            "images": [str(ds/"imagesTs"/fn) for fn in ex["image"]],
+            "label":  str(ds/"labelsTs"/ex["label"])
+        } for ex in test_exs]
+        loader = DataLoader(CacheDataset(data=data, transform=transforms, cache_rate=0.0),
+                            batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=torch.cuda.is_available(),
+                            collate_fn=pad_list_data_collate)
 
         per_case_dice, per_case_hd95 = [], []
         tp = tn = fp = fn = 0
-        self.test_hd95_metric.reset()
         self.model.eval()
         with torch.no_grad():
             for batch in loader:
-                imgs = [m.unsqueeze(1).to(self.device)
-                        for m in torch.unbind(batch["images"], dim=1)]
-                lbl = batch["label"].to(self.device)
-                preds = self.model(imgs)
+                imgs = [m.unsqueeze(1).to(self.device) for m in torch.unbind(batch['images'], dim=1)]
+                preds = self.sw_infer(imgs)
                 pred_lbl = torch.argmax(preds, dim=1)
+                ypb = (pred_lbl > 0); ytb = (batch['label'].to(self.device) > 0)
+                tp += int((ypb & ytb).sum()); tn += int((~ypb & ~ytb).sum())
+                fp += int((ypb & ~ytb).sum()); fn += int((~ypb & ytb).sum())
+                self.test_dice_metric.reset()
+                                # compute one-hot encoded predictions and ground truth
+                pred_oh = one_hot(pred_lbl.unsqueeze(1), self.num_classes)
+                true_oh = one_hot(batch['label'].to(self.device), self.num_classes)
 
-                y_pred_bin = (pred_lbl > 0)
-                y_true_bin = (lbl > 0)
-                tp += int((y_pred_bin & y_true_bin).sum())
-                tn += int((~y_pred_bin & ~y_true_bin).sum())
-                fp += int((y_pred_bin & ~y_true_bin).sum())
-                fn += int((~y_pred_bin & y_true_bin).sum())
-
-                pred_oh = one_hot(pred_lbl.unsqueeze(1), preds.shape[1])
-                true_oh = one_hot(lbl, preds.shape[1])
+                # Dice
                 self.test_dice_metric.reset()
                 self.test_dice_metric(y_pred=pred_oh, y=true_oh)
-                per_case_dice.extend([self.test_dice_metric.aggregate().item()]*batch_size)
+                per_case_dice.append(self.test_dice_metric.aggregate().item())
 
-                self.test_hd95_metric(y_pred=pred_oh, y=true_oh)
-                per_case_hd95.extend([self.test_hd95_metric.aggregate().item()]*batch_size)
+                # HD95
                 self.test_hd95_metric.reset()
+                self.test_hd95_metric(y_pred=pred_oh, y=true_oh)
+                per_case_hd95.append(self.test_hd95_metric.aggregate().item())
 
         mean_dice = float(np.mean(per_case_dice))
         mean_hd95 = float(np.mean(per_case_hd95))
-        mean_sens = tp / (tp + fn) if (tp + fn) else 0.0
-        mean_spec = tn / (tn + fp) if (tn + fp) else 0.0
-
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        
+        
+        def _bootstrap(values, n_bootstraps=1000, seed=42):
+            rng = np.random.default_rng(seed)
+            n = len(values)
+            means = [rng.choice(values, size=n, replace=True).mean() for _ in range(n_bootstraps)]
+            var = float(np.var(means, ddof=1))
+            ci_low, ci_high = np.percentile(means, [2.5, 97.5])
+            return var, ci_low, ci_high
+        
+        dice_var, dice_ci_l, dice_ci_u = _bootstrap(per_case_dice)
+        hd95_var, hd95_ci_l, hd95_ci_u = _bootstrap(per_case_hd95)
+        sens_var, sens_ci_l, sens_ci_u = _bootstrap([sensitivity])
+        spec_var, spec_ci_l, spec_ci_u = _bootstrap([specificity])
+        
+        print(f"Test Results → Dice: {mean_dice:.4f} ± {dice_var:.6f} "
+              f"(95% CI [{dice_ci_l:.3f}, {dice_ci_u:.3f}])")
+        print(f"             HD95: {mean_hd95:.2f} ± {hd95_var:.4f} "
+              f"(95% CI [{hd95_ci_l:.2f}, {hd95_ci_u:.2f}])")
+        print(f"       Sensitivity: {sensitivity:.4f} ± {sens_var:.6f} "
+              f"(95% CI [{sens_ci_l:.3f}, {sens_ci_u:.3f}])")
+        print(f"       Specificity: {specificity:.4f} ± {spec_var:.6f} "
+              f"(95% CI [{spec_ci_l:.3f}, {spec_ci_u:.3f}])")
+        
         return {
             "dice": mean_dice,
+            "dice_var": dice_var,
+            "dice_ci_lower": dice_ci_l,
+            "dice_ci_upper": dice_ci_u,
             "hd95": mean_hd95,
-            "sensitivity": mean_sens,
-            "specificity": mean_spec,
+            "hd95_var": hd95_var,
+            "hd95_ci_lower": hd95_ci_l,
+            "hd95_ci_upper": hd95_ci_u,
+            "sensitivity": sensitivity,
+            "sens_var": sens_var,
+            "sens_ci_lower": sens_ci_l,
+            "sens_ci_upper": sens_ci_u,
+            "specificity": specificity,
+            "spec_var": spec_var,
+            "spec_ci_lower": spec_ci_l,
+            "spec_ci_upper": spec_ci_u,
         }
+
