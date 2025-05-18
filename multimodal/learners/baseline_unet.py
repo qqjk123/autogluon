@@ -8,8 +8,20 @@ import numpy as np
 
 from monai.data import CacheDataset, DataLoader, pad_list_data_collate
 from monai.transforms import (
-    LoadImaged, EnsureChannelFirstd, Spacingd, Orientationd,
-    ScaleIntensityRanged, Lambdad, DivisiblePadd, ToTensord
+    LoadImaged,
+    EnsureChannelFirstd,
+    Spacingd,
+    Orientationd,
+    Lambdad,
+    ScaleIntensityRanged,
+    DivisiblePadd,
+    ToTensord,
+    # —— 以下是数据增强
+    RandFlipd,
+    RandRotate90d,
+    RandZoomd,
+    RandGaussianNoised,
+    RandShiftIntensityd,
 )
 from monai.networks.nets import UNet
 from monai.losses import DiceCELoss
@@ -23,13 +35,11 @@ torch.backends.cudnn.benchmark = True
 class UNetWithDropout(UNet):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        # insert dropout after each Conv block in the bottleneck
+        # 在瓶颈层后插入 Dropout
         self.bottleneck_dropout = nn.Dropout3d(p=0.2)
 
     def forward(self, x):
-        # run through UNet as usual
         x = super().forward(x)
-        # apply dropout on the deepest features
         x = self.bottleneck_dropout(x)
         return x
 
@@ -43,16 +53,15 @@ class BaselineUNetSegmenter:
         self.val_split = val_split
         self.in_channels = in_channels
 
-        # label mapping and classes
+        # 标签映射
         self.LABEL_MAP = {0: 0, 1: 1, 2: 2, 3: 3}
         self.num_classes = len(self.LABEL_MAP)
 
-        # model, optimizer, loss, metrics
+        # 模型、优化器、损失、度量
         self.model = None
         self.optimizer = None
         self.loss_fn = DiceCELoss(to_onehot_y=True, softmax=True)
         self.val_metric = DiceMetric(include_background=False, reduction="mean")
-        # test metrics
         self.test_dice_metric = DiceMetric(include_background=False, reduction="mean")
         self.test_hd95_metric = HausdorffDistanceMetric(
             include_background=False, percentile=95, reduction="mean"
@@ -66,25 +75,36 @@ class BaselineUNetSegmenter:
             channels=(32, 64, 128, 256),
             strides=(2, 2, 2),
             num_res_units=2,
-            norm="instance"   # GroupNorm baked into each conv block
+            norm="instance",
         ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
         self.scaler = torch.cuda.amp.GradScaler()
 
     def _get_dataloader(self, data_list, batch_size, shuffle, num_workers):
+        # 通用预处理
         transforms = [
             LoadImaged(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"]),
-            Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
+            Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0),
+                     mode=("bilinear", "nearest")),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
             Lambdad(keys="label", func=lambda x: np.vectorize(self.LABEL_MAP.get)(x)),
-            ScaleIntensityRanged(
-                keys=["image"], a_min=0, a_max=3000,
-                b_min=0.0, b_max=1.0, clip=True
-            ),
+            ScaleIntensityRanged(keys=["image"], a_min=0, a_max=3000,
+                                 b_min=0.0, b_max=1.0, clip=True),
             DivisiblePadd(keys=["image", "label"], k=8),
-            ToTensord(keys=["image", "label"]),
         ]
+        # 仅在训练时添加随机增强
+        if shuffle:
+            transforms += [
+                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+                RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
+                RandZoomd(keys=["image", "label"], prob=0.3, min_zoom=0.9, max_zoom=1.1),
+                RandGaussianNoised(keys=["image"], prob=0.2, mean=0.0, std=0.1),
+                RandShiftIntensityd(keys=["image"], prob=0.2, offsets=0.10),
+            ]
+        # 转张量
+        transforms.append(ToTensord(keys=["image", "label"]))
+
         ds = CacheDataset(data=data_list, transform=transforms)
         return DataLoader(
             ds, batch_size=batch_size, shuffle=shuffle,
@@ -113,45 +133,46 @@ class BaselineUNetSegmenter:
             for ex in val_exs
         ]
         train_loader = self._get_dataloader(train_data, batch_size, True, num_workers)
-        val_loader = self._get_dataloader(val_data, batch_size, False, num_workers)
+        val_loader   = self._get_dataloader(val_data,   batch_size, False, num_workers)
 
         best_val = 0.0
         for ep in range(1, epochs + 1):
-            # training
+            # 训练
             self.model.train()
             total_loss = 0.0
             for batch in train_loader:
                 imgs = batch["image"].to(self.device, non_blocking=True)
-                lbl = batch["label"].to(self.device, non_blocking=True)
+                lbl  = batch["label"].to(self.device, non_blocking=True)
                 self.optimizer.zero_grad()
-                # autocast
                 with torch.cuda.amp.autocast():
                     preds = self.model(imgs)
-                    loss = self.loss_fn(preds, lbl)
+                    loss  = self.loss_fn(preds, lbl)
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 total_loss += loss.item()
 
-            # validation
+            # 验证
             self.model.eval()
             self.val_metric.reset()
             with torch.no_grad():
                 for batch in val_loader:
                     imgs = batch["image"].to(self.device, non_blocking=True)
-                    lbl = batch["label"].to(self.device, non_blocking=True)
+                    lbl  = batch["label"].to(self.device, non_blocking=True)
                     preds = sliding_window_inference(
                         imgs, roi_size=(128, 128, 128), sw_batch_size=1,
                         predictor=self.model, overlap=0.5
                     )
                     pred_lbl = torch.argmax(preds, dim=1, keepdim=True)
                     oh_pred = one_hot(pred_lbl, num_classes=self.num_classes)
-                    oh_true = one_hot(lbl, num_classes=self.num_classes)
+                    oh_true = one_hot(lbl,      num_classes=self.num_classes)
                     self.val_metric(y_pred=oh_pred, y=oh_true)
                 val_dice = self.val_metric.aggregate().item()
                 self.val_metric.reset()
 
-            print(f"[Epoch {ep}/{epochs}] train loss: {total_loss/len(train_loader):.4f} | val Dice: {val_dice:.4f}")
+            print(f"[Epoch {ep}/{epochs}] "
+                  f"train loss: {total_loss/len(train_loader):.4f} | "
+                  f"val Dice: {val_dice:.4f}")
             if val_dice > best_val:
                 best_val = val_dice
                 torch.save(self.model.state_dict(), str(self.save_dir / "best_model.pt"))
@@ -160,7 +181,7 @@ class BaselineUNetSegmenter:
 
     def predict(self, img: torch.Tensor) -> torch.Tensor:
         if self.model is None:
-            raise RuntimeError("Model not initialized. Call fit_from_nnunet() first.")
+            raise RuntimeError("Model 未初始化，请先调用 fit_from_nnunet()。")
         self.model.eval()
         with torch.no_grad():
             return self.model(img.to(self.device))
@@ -171,17 +192,16 @@ class BaselineUNetSegmenter:
         info = json.load(open(ds / "dataset.json"))
         test_list = info.get("test", info.get("testing", []))
 
-        # test transforms (no random augment)
+        # 测试只做预处理
         test_transforms = [
             LoadImaged(keys=["image", "label"]),
             EnsureChannelFirstd(keys=["image", "label"]),
-            Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0), mode=("bilinear", "nearest")),
+            Spacingd(keys=["image", "label"], pixdim=(1.0, 1.0, 1.0),
+                     mode=("bilinear", "nearest")),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
             Lambdad(keys="label", func=lambda x: np.vectorize(self.LABEL_MAP.get)(x)),
-            ScaleIntensityRanged(
-                keys=["image"], a_min=0, a_max=3000,
-                b_min=0.0, b_max=1.0, clip=True
-            ),
+            ScaleIntensityRanged(keys=["image"], a_min=0, a_max=3000,
+                                 b_min=0.0, b_max=1.0, clip=True),
             DivisiblePadd(keys=["image", "label"], k=8),
             ToTensord(keys=["image", "label"]),
         ]
@@ -192,7 +212,7 @@ class BaselineUNetSegmenter:
             for ex in test_list
         ]
         loader = DataLoader(
-            CacheDataset(data=data_list, transform=test_transforms, cache_rate=0.0),
+            CacheDataset(data=data_list, transform=test_transforms),
             batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=True,
             collate_fn=pad_list_data_collate
@@ -207,14 +227,14 @@ class BaselineUNetSegmenter:
         with torch.no_grad():
             for batch in loader:
                 imgs = batch["image"].to(self.device)
-                lbl = batch["label"].to(self.device)
+                lbl  = batch["label"].to(self.device)
                 preds = sliding_window_inference(
                     imgs, roi_size=(128, 128, 128), sw_batch_size=1,
                     predictor=self.model, overlap=0.5
                 )
                 pred_lbl = torch.argmax(preds, dim=1)
 
-                # confusion
+                # 二分类指标
                 y_pred_bin = (pred_lbl > 0)
                 y_true_bin = (lbl > 0)
                 tp += int((y_pred_bin & y_true_bin).sum())
@@ -222,16 +242,14 @@ class BaselineUNetSegmenter:
                 fp += int((y_pred_bin & ~y_true_bin).sum())
                 fn += int((~y_pred_bin & y_true_bin).sum())
 
-                # one-hot
+                # 一热编码计算 Dice & HD95
                 pred_oh = one_hot(pred_lbl.unsqueeze(1), num_classes=self.num_classes)
-                true_oh = one_hot(lbl, num_classes=self.num_classes)
+                true_oh = one_hot(lbl,                 num_classes=self.num_classes)
 
-                # Dice
                 self.test_dice_metric.reset()
                 self.test_dice_metric(y_pred=pred_oh, y=true_oh)
                 per_case_dice.append(self.test_dice_metric.aggregate().item())
 
-                # HD95
                 self.test_hd95_metric.reset()
                 self.test_hd95_metric(y_pred=pred_oh, y=true_oh)
                 per_case_hd95.append(self.test_hd95_metric.aggregate().item())
@@ -254,10 +272,14 @@ class BaselineUNetSegmenter:
         sens_var, sens_ci_l, sens_ci_u = _bootstrap([sensitivity])
         spec_var, spec_ci_l, spec_ci_u = _bootstrap([specificity])
 
-        print(f"Test Results → Dice: {mean_dice:.4f} ± {dice_var:.6f} (95% CI [{dice_ci_l:.3f}, {dice_ci_u:.3f}])")
-        print(f"             HD95: {mean_hd95:.2f} ± {hd95_var:.4f} (95% CI [{hd95_ci_l:.2f}, {hd95_ci_u:.2f}])")
-        print(f"       Sensitivity: {sensitivity:.4f} ± {sens_var:.6f} (95% CI [{sens_ci_l:.3f}, {sens_ci_u:.3f}])")
-        print(f"       Specificity: {specificity:.4f} ± {spec_var:.6f} (95% CI [{spec_ci_l:.3f}, {spec_ci_u:.3f}])")
+        print(f"Test Results → Dice: {mean_dice:.4f} ± {dice_var:.6f} "
+              f"(95% CI [{dice_ci_l:.3f}, {dice_ci_u:.3f}])")
+        print(f"             HD95: {mean_hd95:.2f} ± {hd95_var:.4f} "
+              f"(95% CI [{hd95_ci_l:.2f}, {hd95_ci_u:.2f}])")
+        print(f"       Sensitivity: {sensitivity:.4f} ± {sens_var:.6f} "
+              f"(95% CI [{sens_ci_l:.3f}, {sens_ci_u:.3f}])")
+        print(f"       Specificity: {specificity:.4f} ± {spec_var:.6f} "
+              f"(95% CI [{spec_ci_l:.3f}, {spec_ci_u:.3f}])")
 
         return {
             "dice": mean_dice,
