@@ -11,6 +11,10 @@ from omegaconf import OmegaConf
 from PIL import Image
 from scipy.special import softmax
 
+from monai.losses import DiceLoss
+from monai.metrics import DiceMetric
+from torchmetrics.segmentation import DiceScore
+
 from autogluon.core.metrics import Scorer
 
 from ..constants import LABEL, LOGITS, SEMANTIC_MASK, SEMANTIC_SEGMENTATION, SEMANTIC_SEGMENTATION_IMG
@@ -22,6 +26,8 @@ from ..optimization.semantic_seg_metrics import Multiclass_IoU_Pred as Multiclas
 from ..optimization.utils import get_loss_func, get_norm_layer_param_names, get_trainable_params_efficient_finetune
 from ..utils import extract_from_output, setup_save_path
 from .base import BaseLearner
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +48,7 @@ class SemanticSegmentationLearner(BaseLearner):
         warn_if_exist: Optional[bool] = True,
         enable_progress_bar: Optional[bool] = None,
         pretrained: Optional[bool] = True,
-        validation_metric: Optional[str] = "iou",
+        validation_metric: Optional[str] = "dice",
         sample_data_path: Optional[str] = None,
         **kwargs,
     ):
@@ -71,6 +77,7 @@ class SemanticSegmentationLearner(BaseLearner):
             else:
                 self._output_shape = infer_output_shape
 
+    
     def get_semantic_segmentation_class_num(self, sample_data_path):
         """
         Get the number of classes for given data.
@@ -133,13 +140,20 @@ class SemanticSegmentationLearner(BaseLearner):
         return peft_param_names
 
     def get_loss_func_per_run(self, config, mixup_active=None):
-        loss_func = get_loss_func(
+        loss_name = OmegaConf.select(config, "optimization.loss_function")
+        if loss_name == "dice":
+            # 二分类或者多分类都用 MONAI 的 DiceLoss
+            return DiceLoss(
+                include_background=False,
+                to_onehot_y=(self._output_shape > 1),
+            )
+        # 否则保持原有逻辑
+        return get_loss_func(
             problem_type=self._problem_type,
-            loss_func_name=OmegaConf.select(config, "optimization.loss_function"),
+            loss_func_name=loss_name,
             config=config.optimization,
             num_classes=self._output_shape,
         )
-        return loss_func
 
     def evaluate_semantic_segmentation(
         self,
@@ -201,6 +215,12 @@ class SemanticSegmentationLearner(BaseLearner):
                     return Binary_IoU()
                 else:
                     return Multiclass_IoU(num_classes=num_classes)
+            elif metric_name == "dice":
+                return DiceMetric(
+                    include_background=False,
+                    reduction="mean",
+                    get_not_nans=False,
+                )
             else:
                 raise ValueError(f"Unknown metric {metric_name}")
 
