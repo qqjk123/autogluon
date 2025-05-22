@@ -1488,8 +1488,8 @@ class BaseLearner(ExportMixin, DistillationMixin, RealtimeMixin):
             if os.path.isfile(best_k_models_yaml_path):
                 os.remove(best_k_models_yaml_path)
             # clean the last checkpoint
-            if os.path.isfile(last_ckpt_path):
-                os.remove(last_ckpt_path)
+            #if os.path.isfile(last_ckpt_path):
+            #    os.remove(last_ckpt_path)
 
     def prepare_deepspeed_offloading(self, strategy):
         # TODO: Using optimiation_kwargs for inference is confusing and bad design. Remove as soon as fixed in lightning.
