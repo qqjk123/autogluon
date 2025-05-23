@@ -6,4 +6,5 @@ from .object_detection import ObjectDetectionLearner
 from .semantic_segmentation import SemanticSegmentationLearner
 from .unet_classifier import UNetPredictor
 from .resnet_classifier import ResNetPredictor
-from .unet_segmenter import UNetSeg, RemapLabels, center_crop
+from .multimodal_classifier import MultiModalClassificationLearner
+from .unet_segmenter import UNetSeg
