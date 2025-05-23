@@ -1,282 +1,305 @@
+#!/usr/bin/env python3
+"""
+Parallelized training script for 3D ResNet classification using PyTorch DataLoader.
+Method 1: loads and preprocesses each case in Dataset workers.
+"""
 import os
-import json
+import argparse
 import numpy as np
 import pandas as pd
 import nibabel as nib
 import torch
 import torch.nn as nn
 from torch.optim import Adam
-from torch.utils.data import DataLoader, TensorDataset
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.cuda.amp import autocast, GradScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    roc_auc_score,
-    recall_score
-)
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, recall_score
 from monai.networks.nets import resnet18
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+
+class CaseDataset(Dataset):
+    def __init__(self, metadata_csv, case_ids, global_shape, normalize=True):
+        self.df = pd.read_csv(metadata_csv, dtype={"case_id": str}, encoding="utf-8-sig")
+        self.ids = case_ids
+        self.Dg, self.Hg, self.Wg = global_shape
+        self.normalize = normalize
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        cid = self.ids[idx]
+        g = self.df[self.df.case_id == cid]
+        vols = []
+        for m in ["FLAIR", "T1w", "T1wCE", "T2w"]:
+            arr = nib.load(g[g.modality == m].image_path.iloc[0]).get_fdata().astype(np.float32)
+            d, h, w = arr.shape
+            d0 = max((d - self.Dg) // 2, 0)
+            h0 = max((h - self.Hg) // 2, 0)
+            w0 = max((w - self.Wg) // 2, 0)
+            crop = arr[d0:d0+self.Dg, h0:h0+self.Hg, w0:w0+self.Wg]
+            pad_d = max(self.Dg - crop.shape[0], 0)
+            pad_h = max(self.Hg - crop.shape[1], 0)
+            pad_w = max(self.Wg - crop.shape[2], 0)
+            padded = np.pad(
+                crop,
+                ((pad_d//2, pad_d - pad_d//2),
+                 (pad_h//2, pad_h - pad_h//2),
+                 (pad_w//2, pad_w - pad_w//2)),
+                mode="constant",
+                constant_values=0
+            )
+            vols.append(padded)
+        X = np.stack(vols, axis=0)
+        if self.normalize:
+            X = (X - X.min()) / (X.max() - X.min() + 1e-8)
+        y = int(g.label.iloc[0])
+        return torch.from_numpy(X), torch.tensor(y, dtype=torch.long)
+
 
 class ResNetClassifier(nn.Module):
     def __init__(self, in_channels, num_classes):
         super().__init__()
-        print(f"Initializing ResNetClassifier(in_channels={in_channels}, num_classes={num_classes})")
         self.backbone = resnet18(
             spatial_dims=3,
             n_input_channels=in_channels,
             num_classes=num_classes,
             pretrained=False
         )
+
     def forward(self, x):
         return self.backbone(x)
+
 
 class ResNetPredictor:
     def __init__(
         self,
-        metadata_csv: str,
-        output_dir: str,
-        in_channels: int = 4,
-        batch_size: int = 16,
-        lr: float = 2e-4,
-        weight_decay: float = 1e-5,
-        max_epochs: int = 50,
-        patience: int = 10,
-        accumulation_steps: int = 1,
-        use_amp: bool = True,
-        val_split: float = 0.2,
-        num_workers: int = 4,
-        pin_memory: bool = True,
-        n_bootstrap: int = 1000,
-        ci_alpha: float = 0.05
+        metadata_csv,
+        output_dir,
+        in_channels=4,
+        batch_size=16,
+        lr=2e-4,
+        weight_decay=1e-5,
+        max_epochs=50,
+        patience=10,
+        accumulation_steps=1,
+        use_amp=True,
+        val_split=0.2,
+        num_workers=4,
+        pin_memory=True,
+        n_bootstrap=1000,
+        ci_alpha=0.05
     ):
-        # ——————— Initialization ———————
         os.makedirs(output_dir, exist_ok=True)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Device: {self.device}, batch_size: {batch_size}, AMP: {use_amp}")
+        print(f"Device: {self.device}, batch_size: {batch_size}, AMP: {use_amp}, workers: {num_workers}")
 
-        # params
+        # 参数
         self.meta_csv = metadata_csv
-        self.out_dir   = output_dir
-        self.C         = in_channels
-        self.bs        = batch_size
-        self.lr        = lr
-        self.wd        = weight_decay
-        self.epochs    = max_epochs
-        self.patience  = patience
+        self.out_dir = output_dir
+        self.C = in_channels
+        self.bs = batch_size
+        self.lr = lr
+        self.wd = weight_decay
+        self.epochs = max_epochs
+        self.patience = patience
         self.acc_steps = accumulation_steps
-        self.amp       = use_amp
+        self.amp = use_amp
         self.val_split = val_split
-        self.nw        = num_workers
-        self.pm        = pin_memory
-        self.n_boot    = n_bootstrap
-        self.alpha     = ci_alpha
+        self.nw = num_workers
+        self.pm = pin_memory
+        self.n_boot = n_bootstrap
+        self.alpha = ci_alpha
+        self.best_model_path = None  # Track path to best checkpoint
 
-        # read metadata & train/val/test splits
+        # 读取 splits
         df = pd.read_csv(self.meta_csv, dtype={"case_id": str}, encoding="utf-8-sig")
-        ids_tr = df[df.split=="train"].case_id.unique().tolist()
-        ids_ts = df[df.split=="test"].case_id.unique().tolist()
+        ids = df.case_id.unique().tolist()
         labels = df.drop_duplicates("case_id").set_index("case_id")["label"].to_dict()
-        if self.val_split>0 and len(ids_tr)>1:
-            tr, vl = train_test_split(
-                ids_tr,
-                test_size=self.val_split,
-                stratify=[labels[i] for i in ids_tr],
-                random_state=42
-            )
-        else:
-            tr, vl = ids_tr, []
-        self.train_ids, self.val_ids, self.test_ids = tr, vl, ids_ts
-        print(f"Found {len(tr)} train, {len(vl)} val, {len(ids_ts)} test cases.")
+        train_ids, test_ids = train_test_split(
+            ids, test_size=val_split+0.0, stratify=[labels[i] for i in ids], random_state=42
+        )
+        train_ids, val_ids = train_test_split(
+            train_ids, test_size=val_split/(1-val_split), stratify=[labels[i] for i in train_ids], random_state=42
+        )
+        self.train_ids, self.val_ids, self.test_ids = train_ids, val_ids, test_ids
+        print(f"Found {len(train_ids)} train, {len(val_ids)} val, {len(test_ids)} test cases.")
 
-        # compute a fixed crop‐shape across all cases
-        self._compute_global_shape(tr + vl + ids_ts)
+        # 计算 global_shape
+        self.global_shape = self._compute_global_shape()
 
-    def _compute_global_shape(self, case_ids):
+    def _compute_global_shape(self):
         df = pd.read_csv(self.meta_csv, dtype={"case_id": str}, encoding="utf-8-sig")
-        mins = []
-        for cid in case_ids:
-            g = df[df.case_id==cid]
-            shapes = []
-            for m in ["FLAIR","T1w","T1wCE","T2w"]:
-                fp = g[g.modality==m].image_path.iloc[0]
-                shapes.append(nib.load(fp).shape)
-            shapes = np.stack(shapes,0)
-            mins.append(shapes.min(axis=0))
-        self.global_shape = tuple(int(x) for x in np.stack(mins,0).min(axis=0))
-        print(f"Global crop shape set to D,H,W = {self.global_shape}")
-
-    def _load_cases(self, case_ids):
-        df = pd.read_csv(self.meta_csv, dtype={"case_id": str}, encoding="utf-8-sig")
-        Dg, Hg, Wg = self.global_shape
-        X, y = [], []
-        for cid in case_ids:
-            g = df[df.case_id==cid]
-            vols = []
-            for m in ["FLAIR","T1w","T1wCE","T2w"]:
-                v = nib.load(g[g.modality==m].image_path.iloc[0]).get_fdata().astype(np.float32)
-                d,h,w = v.shape
-                d0 = (d - Dg)//2; h0 = (h - Hg)//2; w0 = (w - Wg)//2
-                vols.append(v[d0:d0+Dg, h0:h0+Hg, w0:w0+Wg])
-            X.append(np.stack(vols,0)); y.append(int(g.label.iloc[0]))
-        X = np.stack(X,0); y = np.array(y, dtype=np.int64)
-        return X, y
-
-    def _make_loader(self, X, y, shuffle):
-        X = (X - X.min())/(X.max()-X.min()+1e-8)
-        ds = TensorDataset(torch.tensor(X, dtype=torch.float32),
-                           torch.tensor(y, dtype=torch.long))
-        return DataLoader(ds,
-                          batch_size=self.bs,
-                          shuffle=shuffle,
-                          num_workers=self.nw,
-                          pin_memory=self.pm)
+        shapes = []
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="Inspect shapes", unit="img"):
+            try:
+                shapes.append(nib.load(row.image_path).shape)
+            except Exception:
+                pass
+        arr = np.array(shapes)
+        means = np.round(arr.mean(axis=0)).astype(int)
+        div = 16
+        target = ((means + div - 1) // div) * div
+        print(f"Global shape = {tuple(target)}")
+        return tuple(target)
 
     def fit(self):
-        # ——————— Training Loop ———————
-        X_tr, y_tr = self._load_cases(self.train_ids)
-        tr_loader = self._make_loader(X_tr, y_tr, True)
-        if self.val_ids:
-            X_vl, y_vl = self._load_cases(self.val_ids)
-            vl_loader = self._make_loader(X_vl, y_vl, False)
+        # 构建 DataLoader
+        train_ds = CaseDataset(self.meta_csv, self.train_ids, self.global_shape)
+        tr_loader = DataLoader(
+            train_ds, batch_size=self.bs, shuffle=True,
+            num_workers=self.nw, pin_memory=self.pm
+        )
+        val_ds = CaseDataset(self.meta_csv, self.val_ids, self.global_shape)
+        vl_loader = DataLoader(
+            val_ds, batch_size=self.bs, shuffle=False,
+            num_workers=self.nw, pin_memory=self.pm
+        )
 
-        nc = len(np.unique(y_tr))
+        # 计算类别数
+        df_meta = pd.read_csv(self.meta_csv, dtype={"case_id": str}, encoding="utf-8-sig")
+        labels = df_meta.drop_duplicates("case_id").set_index("case_id")["label"].to_dict()
+        nc = len(set(labels.values()))
         self.model = ResNetClassifier(self.C, nc).to(self.device)
         optimizer = Adam(self.model.parameters(), lr=self.lr, weight_decay=self.wd)
-        scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5,
-                                      patience=5, min_lr=1e-6)
+        scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-6)
         scaler = GradScaler()
-        
+
         best_auc = -np.inf
         wait = 0
-
-        for epoch in range(1, self.epochs+1):
-            print(f"\n=== Epoch {epoch}/{self.epochs} ===")
-            # — training —
+        for epoch in range(1, self.epochs + 1):
+            print(f"\nEpoch {epoch}/{self.epochs}")
             self.model.train()
-            running_loss = 0.0
-            optimizer.zero_grad()
-            for i, (Xb, yb) in enumerate(tr_loader,1):
+            train_loss = 0
+            for i, (Xb, yb) in enumerate(tqdm(tr_loader, desc="Train", unit="batch"), 1):
                 Xb, yb = Xb.to(self.device), yb.to(self.device)
                 with autocast(self.amp):
                     logits = self.model(Xb)
-                    loss = nn.CrossEntropyLoss()(logits, yb)/self.acc_steps
+                    loss = nn.CrossEntropyLoss()(logits, yb) / self.acc_steps
                 scaler.scale(loss).backward()
                 if i % self.acc_steps == 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    scaler.step(optimizer); scaler.update(); optimizer.zero_grad()
-                running_loss += loss.item()*self.acc_steps
-            print(f"  Train loss: {running_loss/len(tr_loader):.4f}")
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                train_loss += loss.item() * self.acc_steps
+            print(f"Train loss: {train_loss/len(tr_loader):.4f}")
 
-            # — validation —
-            if self.val_ids:
-                print("  Validating…")
-                self.model.eval()
-                all_preds, all_trues, all_probs = [], [], []
-                with torch.no_grad():
-                    for Xb,yb in vl_loader:
-                        Xb, yb = Xb.to(self.device), yb.to(self.device)
-                        out = torch.softmax(self.model(Xb),1)
-                        preds = out.argmax(1)
-                        all_preds.append(preds.cpu().numpy())
-                        all_trues.append(yb.cpu().numpy())
-                        all_probs.append(out.cpu().numpy()[:,1] if nc==2 else out.cpu().numpy())
-                preds = np.concatenate(all_preds)
-                trues = np.concatenate(all_trues)
-                probs = np.concatenate(all_probs)
-                acc = accuracy_score(trues, preds)
-                auc = (roc_auc_score(trues, probs)
-                       if nc==2 else roc_auc_score(trues, probs, multi_class="ovr", average="macro"))
-                print(f"  Val Acc={acc:.4f}, AUC={auc:.4f}")
-                scheduler.step(auc)
+            # 验证
+            self.model.eval()
+            all_preds, all_trues, all_probs = [], [], []
+            with torch.no_grad():
+                for Xb, yb in tqdm(vl_loader, desc="Val", unit="batch"):
+                    Xb, yb = Xb.to(self.device), yb.to(self.device)
+                    out = torch.softmax(self.model(Xb), dim=1)
+                    all_preds.append(out.argmax(1).cpu().numpy())
+                    all_trues.append(yb.cpu().numpy())
+                    if out.shape[1] == 2:
+                        all_probs.append(out.cpu().numpy()[:, 1])
+                    else:
+                        all_probs.append(out.cpu().numpy())
+            preds = np.concatenate(all_preds)
+            trues = np.concatenate(all_trues)
+            probs = np.concatenate(all_probs)
+            acc = accuracy_score(trues, preds)
+            auc = roc_auc_score(trues, probs) if probs.ndim == 1 else roc_auc_score(trues, probs, multi_class="ovr")
+            print(f"Val Acc={acc:.4f}, AUC={auc:.4f}")
+            scheduler.step(auc)
 
-                # save best‐AUC model
-                if auc > best_auc:
-                    best_auc = auc; wait = 0
-                    best_path = os.path.join(self.out_dir, f"best_auc_epoch{epoch}.pt")
-                    torch.save(self.model.state_dict(), best_path)
-                    print(f"  → New best AUC; model saved to {best_path}")
-                    self.best_model_path = best_path
-                else:
-                    wait += 1
-                    if wait >= self.patience:
-                        print("  Early stopping on AUC")
-                        break
-
-        # always save final too
-        final_path = os.path.join(self.out_dir, "final.pt")
-        torch.save(self.model.state_dict(), final_path)
-        print(f"Training done. Final model at {final_path}")
-
-    def _bootstrap_eval(self, trues, preds, probs):
-        """Compute bootstrap CIs for acc, auc, f1, recall."""
-        rng = np.random.RandomState(42)
-        metrics = {"acc":[], "auc":[], "f1":[],"sens":[]}
-        n = len(trues)
-        for _ in range(self.n_boot):
-            idx = rng.randint(0, n, size=n)
-            yt = trues[idx]
-            yp = preds[idx]
-            pv = probs[idx] if probs.ndim==1 else probs[idx,1]
-            metrics["acc"].append(accuracy_score(yt, yp))
-            metrics["auc"].append(roc_auc_score(yt, pv))
-            metrics["f1"].append(f1_score(yt, yp, average="macro"))
-            metrics["sens"].append(recall_score(yt, yp, average="macro"))
-        out = {}
-        for k, vals in metrics.items():
-            m = float(np.mean(vals))
-            lo = float(np.percentile(vals,    100*self.alpha/2))
-            hi = float(np.percentile(vals,100*(1-self.alpha/2)))
-            out[f"{k}"]    = m
-            out[f"{k}_ci"] = (lo, hi)
-        return out
+            if auc > best_auc:
+                best_auc = auc
+                wait = 0
+                ckpt_path = os.path.join(self.out_dir, "best.pt")
+                torch.save(self.model.state_dict(), ckpt_path)
+                self.best_model_path = ckpt_path
+                print(f"Saved new best to {ckpt_path}.")
+            else:
+                wait += 1
+                if wait >= self.patience:
+                    print("Early stop")
+                    break
 
     def evaluate(self):
-        """Loads best‐AUC checkpoint, runs a single pass plus bootstrap."""
+        """Loads best‐AUC checkpoint, runs DataLoader‐based test pass + bootstrap."""
         print("\n=== Bootstrap test evaluation ===")
-        # load the best‐AUC model
         ckpt = getattr(self, "best_model_path", None)
         if ckpt is None:
             raise RuntimeError("No best‐AUC model found. Run fit() first.")
         self.model.load_state_dict(torch.load(ckpt, map_location=self.device))
         self.model.eval()
 
-        X_ts, y_ts = self._load_cases(self.test_ids)
-        loader = self._make_loader(X_ts, y_ts, False)
+        test_ds = CaseDataset(self.meta_csv, self.test_ids, self.global_shape, normalize=True)
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=self.bs,
+            shuffle=False,
+            num_workers=self.nw,
+            pin_memory=self.pm,
+            persistent_workers=True,
+            prefetch_factor=2
+        )
 
         all_preds, all_trues, all_probs = [], [], []
         with torch.no_grad():
-            for Xb,yb in loader:
+            for Xb, yb in tqdm(test_loader, desc="Test", unit="batch"):
                 Xb, yb = Xb.to(self.device), yb.to(self.device)
-                out = torch.softmax(self.model(Xb),1)
-                preds = out.argmax(1)
-                all_preds.append(preds.cpu().numpy())
+                out = torch.softmax(self.model(Xb), dim=1)
+                all_preds.append(out.argmax(1).cpu().numpy())
                 all_trues.append(yb.cpu().numpy())
-                # for binary: take class-1 prob; for multi: keep full array
-                all_probs.append(out.cpu().numpy()[:,1] 
-                                 if out.shape[1]==2 else out.cpu().numpy())
+                if out.shape[1] == 2:
+                    all_probs.append(out.cpu().numpy()[:, 1])
+                else:
+                    all_probs.append(out.cpu().numpy())
+
         preds = np.concatenate(all_preds)
         trues = np.concatenate(all_trues)
         probs = np.concatenate(all_probs)
 
         results = self._bootstrap_eval(trues, preds, probs)
         print("Test set (bootstrap):")
-        print(f"  Acc       = {results['acc']:.4f} ± [{results['acc_ci'][0]:.4f}, {results['acc_ci'][1]:.4f}]")
-        print(f"  AUC       = {results['auc']:.4f} ± [{results['auc_ci'][0]:.4f}, {results['auc_ci'][1]:.4f}]")
-        print(f"  F1-score  = {results['f1']:.4f} ± [{results['f1_ci'][0]:.4f}, {results['f1_ci'][1]:.4f}]")
+        print(f"  Acc         = {results['acc']:.4f} ± [{results['acc_ci'][0]:.4f}, {results['acc_ci'][1]:.4f}]")
+        print(f"  AUC         = {results['auc']:.4f} ± [{results['auc_ci'][0]:.4f}, {results['auc_ci'][1]:.4f}]")
+        print(f"  F1-score    = {results['f1']:.4f} ± [{results['f1_ci'][0]:.4f}, {results['f1_ci'][1]:.4f}]")
         print(f"  Sensitivity = {results['sens']:.4f} ± [{results['sens_ci'][0]:.4f}, {results['sens_ci'][1]:.4f}]")
         return results
 
-# ——— USAGE ———
-if __name__=="__main__":
-    predictor = ResNetPredictor(
-        metadata_csv = "metadata.csv",
-        output_dir   = "output/resnet_bootstrap",
-        max_epochs   = 50,
-        patience     = 10,
-        n_bootstrap  = 1000,
-        ci_alpha     = 0.05
-    )
-    predictor.fit()
-    test_metrics = predictor.evaluate()
+    def _bootstrap_eval(self, trues, preds, probs):
+        # implement bootstrap confidence intervals here
+        import numpy as np
+        from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, recall_score
+        n = len(trues)
+        idx = np.arange(n)
+        stats = {'acc': accuracy_score(trues, preds),
+                 'auc': roc_auc_score(trues, probs) if probs.ndim == 1 else roc_auc_score(trues, probs, multi_class='ovr'),
+                 'f1': f1_score(trues, preds, average='binary' if preds.ndim==1 else 'macro'),
+                 'sens': recall_score(trues, preds, average='binary' if preds.ndim==1 else 'macro')}
+        ci = {k + '_ci': [] for k in stats}
+        for _ in range(self.n_boot):
+            sample = np.random.choice(idx, size=n, replace=True)
+            t_s, p_s, prob_s = trues[sample], preds[sample], probs[sample]
+            ci['acc_ci'].append(accuracy_score(t_s, p_s))
+            ci['auc_ci'].append(roc_auc_score(t_s, prob_s) if prob_s.ndim == 1 else roc_auc_score(t_s, prob_s, multi_class='ovr'))
+            ci['f1_ci'].append(f1_score(t_s, p_s, average='binary' if p_s.ndim==1 else 'macro'))
+            ci['sens_ci'].append(recall_score(t_s, p_s, average='binary' if p_s.ndim==1 else 'macro'))
+        results = {}
+        for k in stats:
+            lower = np.percentile(ci[k+'_ci'], 100 * self.alpha/2)
+            upper = np.percentile(ci[k+'_ci'], 100 * (1-self.alpha/2))
+            results[k] = stats[k]
+            results[k+'_ci'] = (lower, upper)
+        return results
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--metadata_csv", required=True, help="Path to metadata CSV")
+    p.add_argument("--output_dir", required=True, help="Directory to save models and logs")
+    p.add_argument("--batch_size", type=int, default=16, help="Mini-batch size")
+    p.add_argument("--num_workers", type=int, default=4, help="DataLoader worker count")
+    p.add_argument("--max_epochs", type=int, default=50, help="Maximum training epochs")
+    p.add_argument("--patience", type=int, default=10, help="Early stopping patience")
+    return p.parse_args()
