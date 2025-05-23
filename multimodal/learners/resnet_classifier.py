@@ -115,18 +115,25 @@ class ResNetPredictor:
         self.alpha = ci_alpha
         self.best_model_path = None  # Track path to best checkpoint
 
-        # 读取 splits
-        df = pd.read_csv(self.meta_csv, dtype={"case_id": str}, encoding="utf-8-sig")
-        ids = df.case_id.unique().tolist()
-        labels = df.drop_duplicates("case_id").set_index("case_id")["label"].to_dict()
-        train_ids, test_ids = train_test_split(
-            ids, test_size=val_split+0.0, stratify=[labels[i] for i in ids], random_state=42
+        # 读取 splits: test set 固定为 metadata 中标记为 'test' 的 case，其余按 val_split 划分为 train/val
+        df_all = pd.read_csv(self.meta_csv, dtype={"case_id": str}, encoding="utf-8-sig")
+        if 'split' in df_all.columns:
+            df_test = df_all[df_all['split'] == 'test']
+            df_tv = df_all[df_all['split'] != 'test']
+        else:
+            # 若无 split 列，则将所有数据用于 train/val，test 使用全部
+            df_test = df_all.copy()
+            df_tv = df_all.copy()
+        self.test_ids = df_test.case_id.unique().tolist()
+        ids_tv = df_tv.case_id.unique().tolist()
+        labels_tv = df_tv.drop_duplicates('case_id').set_index('case_id')['label'].to_dict()
+        self.train_ids, self.val_ids = train_test_split(
+            ids_tv,
+            test_size=self.val_split,
+            stratify=[labels_tv[i] for i in ids_tv],
+            random_state=42
         )
-        train_ids, val_ids = train_test_split(
-            train_ids, test_size=val_split/(1-val_split), stratify=[labels[i] for i in train_ids], random_state=42
-        )
-        self.train_ids, self.val_ids, self.test_ids = train_ids, val_ids, test_ids
-        print(f"Found {len(train_ids)} train, {len(val_ids)} val, {len(test_ids)} test cases.")
+        print(f"Found {len(self.train_ids)} train, {len(self.val_ids)} val, {len(self.test_ids)} test cases.")
 
         # 计算 global_shape
         self.global_shape = self._compute_global_shape()
@@ -303,3 +310,5 @@ def parse_args():
     p.add_argument("--max_epochs", type=int, default=50, help="Maximum training epochs")
     p.add_argument("--patience", type=int, default=10, help="Early stopping patience")
     return p.parse_args()
+
+
