@@ -172,10 +172,10 @@ class ResNetPredictor:
         nc = len(set(labels.values()))
         self.model = ResNetClassifier(self.C, nc).to(self.device)
         optimizer = Adam(self.model.parameters(), lr=self.lr, weight_decay=self.wd)
-        scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-6)
+        scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3, min_lr=1e-6)
         scaler = GradScaler()
 
-        best_auc = -np.inf
+        best_acc = -np.inf
         wait = 0
         for epoch in range(1, self.epochs + 1):
             print(f"\nEpoch {epoch}/{self.epochs}")
@@ -215,10 +215,10 @@ class ResNetPredictor:
             acc = accuracy_score(trues, preds)
             auc = roc_auc_score(trues, probs) if probs.ndim == 1 else roc_auc_score(trues, probs, multi_class="ovr")
             print(f"Val Acc={acc:.4f}, AUC={auc:.4f}")
-            scheduler.step(auc)
+            scheduler.step(acc)
 
-            if auc > best_auc:
-                best_auc = auc
+            if acc > best_acc:
+                best_acc = acc
                 wait = 0
                 ckpt_path = os.path.join(self.out_dir, "best.pt")
                 torch.save(self.model.state_dict(), ckpt_path)
@@ -231,7 +231,7 @@ class ResNetPredictor:
                     break
 
     def evaluate(self):
-        """Loads best‐AUC checkpoint, runs DataLoader‐based test pass + bootstrap."""
+        """Loads best‐ACC checkpoint, runs DataLoader‐based test pass + bootstrap."""
         print("\n=== Bootstrap test evaluation ===")
         ckpt = getattr(self, "best_model_path", None)
         if ckpt is None:
