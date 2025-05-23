@@ -1,4 +1,3 @@
-
 # classification_learner.py
 import os
 from pathlib import Path
@@ -48,7 +47,7 @@ class MultiModalClassifier(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feats = []
         for i, enc in enumerate(self.encoders):
-            xi = x[:, i:i+1]
+            xi = x[:, i:i+1].contiguous()
             hi = enc(xi)
             feats.append(hi.view(x.shape[0], -1))
         h = torch.cat(feats, dim=1)
@@ -67,7 +66,7 @@ class MultiModalClassificationLearner:
         val_split: float = 0.2,
         epochs: int = 50,
         num_workers: int = 4,
-        n_bootstrap: int = 1000,  # 推荐 1000 次，自行可调至 2000+ 获得更稳定估计
+        n_bootstrap: int = 1000,
         ci_alpha: float = 0.05,
         device: str | torch.device = None,
     ):
@@ -107,11 +106,10 @@ class MultiModalClassificationLearner:
     def _get_dataloaders(self):
         df = pd.read_csv(self.metadata_csv, dtype={'case_id': str})
         data_list = self._prepare_data_list(df)
-        # 保证 split 标注为 'test' 的始终为测试集
         train_list = [x for x in data_list if x['split'] == 'train']
         val_list   = [x for x in data_list if x['split'] == 'val']
         test_list  = [x for x in data_list if x['split'] == 'test']
-        # 若未显式标注，则基于 val_split 拆分 train/val
+
         if not (train_list and val_list and test_list):
             all_list = data_list
             train_list, test_list = train_test_split(
@@ -122,6 +120,7 @@ class MultiModalClassificationLearner:
                 train_list, test_size=self.val_split,
                 stratify=[x['label'] for x in train_list], random_state=42
             )
+
         def make_loader(items, shuffle: bool):
             transforms = [
                 LoadImaged(keys=self.modalities),
@@ -138,13 +137,14 @@ class MultiModalClassificationLearner:
             return DataLoader(
                 ds, batch_size=self.batch_size, shuffle=shuffle,
                 num_workers=self.num_workers, pin_memory=True,
+                persistent_workers=True, prefetch_factor=2,
                 collate_fn=pad_list_data_collate
             )
+
         return make_loader(train_list, True), make_loader(val_list, False), make_loader(test_list, False)
 
     def fit(self):
         train_loader, val_loader, test_loader = self._get_dataloaders()
-        # 显示数据集大小
         print(f"Dataset sizes -> Train: {len(train_loader.dataset)}, Val: {len(val_loader.dataset)}, Test: {len(test_loader.dataset)}")
 
         num_classes = len({x['label'] for x in self._prepare_data_list(pd.read_csv(self.metadata_csv))})
@@ -157,8 +157,8 @@ class MultiModalClassificationLearner:
         for epoch in range(1, self.epochs + 1):
             self.model.train()
             for batch in train_loader:
-                imgs = batch['image'].to(self.device)
-                lbls = batch['label'].to(self.device)
+                imgs = batch['image'].to(self.device, non_blocking=True)
+                lbls = batch['label'].to(self.device, non_blocking=True)
                 self.optimizer.zero_grad()
                 logits = self.model(imgs)
                 loss = self.criterion(logits, lbls)
@@ -168,8 +168,8 @@ class MultiModalClassificationLearner:
             preds, trues = [], []
             with torch.no_grad():
                 for batch in val_loader:
-                    imgs = batch['image'].to(self.device)
-                    lbls = batch['label'].to(self.device)
+                    imgs = batch['image'].to(self.device, non_blocking=True)
+                    lbls = batch['label'].to(self.device, non_blocking=True)
                     logits = self.model(imgs)
                     preds.append(torch.argmax(logits, dim=1).cpu().numpy())
                     trues.append(lbls.cpu().numpy())
@@ -189,8 +189,8 @@ class MultiModalClassificationLearner:
         all_preds, all_trues, all_probs = [], [], []
         with torch.no_grad():
             for batch in test_loader:
-                imgs = batch['image'].to(self.device)
-                lbls = batch['label'].to(self.device)
+                imgs = batch['image'].to(self.device, non_blocking=True)
+                lbls = batch['label'].to(self.device, non_blocking=True)
                 logits = self.model(imgs)
                 probs = torch.softmax(logits, dim=1).cpu().numpy()
                 if probs.shape[1] == 2:
@@ -234,5 +234,3 @@ class MultiModalClassificationLearner:
             results[k] = v
             results[k + '_ci'] = (lower, upper)
         return results
-
-
