@@ -6,7 +6,7 @@ import torch.optim as optim
 from pathlib import Path
 import numpy as np
 
-from monai.data import CacheDataset, DataLoader, pad_list_data_collate
+from monai.data import CacheDataset, DataLoader, pad_list_data_collate, SmartCacheDataset
 from monai.transforms import (
     LoadImaged,
     EnsureChannelFirstd,
@@ -45,13 +45,19 @@ class UNetWithDropout(UNet):
 
 class BaselineUNetSegmenter:
     def __init__(self, save_dir: str, lr: float = 1e-4,
-                 val_split: float = 0.2, in_channels: int = 4):
+                 val_split: float = 0.2, in_channels: int = 4, 
+                patience: int = 10, 
+                lr_factor: float = 0.5,
+                lr_patience: int = 5):
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.lr = lr
         self.val_split = val_split
         self.in_channels = in_channels
+        self.es_patience = patience            # 用于 early stopping
+        self.lr_factor = lr_factor            # ReduceLROnPlateau 因子
+        self.lr_patience = lr_patience        # ReduceLROnPlateau 耐心
 
         # 标签映射
         self.LABEL_MAP = {0: 0, 1: 1, 2: 2, 3: 3}
@@ -78,6 +84,13 @@ class BaselineUNetSegmenter:
             norm="instance",
         ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer=self.optimizer,
+            mode='max',
+            factor=self.lr_factor,
+            patience=self.lr_patience,
+            verbose=True
+        )
         self.scaler = torch.cuda.amp.GradScaler()
 
     def _get_dataloader(self, data_list, batch_size, shuffle, num_workers):
@@ -105,12 +118,30 @@ class BaselineUNetSegmenter:
         # 转张量
         transforms.append(ToTensord(keys=["image", "label"]))
 
-        ds = CacheDataset(data=data_list, transform=transforms)
-        return DataLoader(
-            ds, batch_size=batch_size, shuffle=shuffle,
-            num_workers=num_workers, pin_memory=True,
+        #ds = CacheDataset(data=data_list, transform=transforms)
+        #cache_rate = 1.0 if not shuffle else 0.35
+
+        cache_rate = 0.2
+        
+        ds = CacheDataset(
+            data=data_list,
+            transform=transforms,
+            cache_rate=cache_rate,     # 0 表示不缓存
+        )
+
+        
+        loader = DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,      # 或更多，视 CPU 核心数而定
+            pin_memory=True,
             collate_fn=pad_list_data_collate
         )
+
+        print("Number of Workers:", loader.num_workers)
+
+        return loader
 
     def fit_from_nnunet(self, nnunet_raw: str, task_id: str,
                         epochs: int = 50, batch_size: int = 1,
@@ -132,10 +163,26 @@ class BaselineUNetSegmenter:
              "label": str(ds / "labelsTr" / ex["label"])}
             for ex in val_exs
         ]
+
+        
+        print(f"使用 val_split={self.val_split:.2f} 划分")
+        print("原始 training 样本数:", len(examples))
+        print("train_exs 样本数:", len(train_exs))
+        print("val_exs   样本数:", len(val_exs))
+        print("batch_size:", batch_size)
+        
         train_loader = self._get_dataloader(train_data, batch_size, True, num_workers)
         val_loader   = self._get_dataloader(val_data,   batch_size, False, num_workers)
+        
+        print(f"Samples / Batches →")
+        print(f"  train: {len(train_loader.dataset)} samples, {len(train_loader)} batches")
+        print(f"  val:   {len(val_loader.dataset)} samples, {len(val_loader)} batches")
 
+
+
+        
         best_val = 0.0
+        no_improve = 0
         for ep in range(1, epochs + 1):
             # 训练
             self.model.train()
@@ -173,9 +220,23 @@ class BaselineUNetSegmenter:
             print(f"[Epoch {ep}/{epochs}] "
                   f"train loss: {total_loss/len(train_loader):.4f} | "
                   f"val Dice: {val_dice:.4f}")
+            
+            self.scheduler.step(val_dice)
+
+            current_lr = self.optimizer.param_groups[0]['lr']
+            print(f" → lr now: {current_lr:.2e}")
+
             if val_dice > best_val:
                 best_val = val_dice
+                no_improve = 0
                 torch.save(self.model.state_dict(), str(self.save_dir / "best_model.pt"))
+                print(f"  ➞ New best at epoch {ep}: val Dice {val_dice:.4f}, saving model.")
+
+            else:
+                no_improve += 1
+                if no_improve >= self.es_patience:
+                    print(f"Early stopping at epoch {ep}, no improvement for {self.es_patience} epochs.")
+                    break
 
         print(f"训练完成，最佳 val Dice={best_val:.4f}")
 
