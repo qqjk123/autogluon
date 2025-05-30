@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-#v1
 import os
 import json
 import torch
@@ -28,10 +27,11 @@ from monai.transforms import (
 )
 from monai.networks.nets import UNETR
 from monai.losses import DiceCELoss
+from monai.networks.layers import DropPath
 from monai.metrics import DiceMetric, HausdorffDistanceMetric
 from monai.inferers import sliding_window_inference
 from monai.networks.utils import one_hot
-
+from torch.optim.lr_scheduler import OneCycleLR
 # 1. cuDNN 自动调优
 torch.backends.cudnn.benchmark = True
 
@@ -44,7 +44,6 @@ class BaselineUNETRSegmenter:
         self.lr = lr
         self.val_split = val_split
         self.in_channels = in_channels
-
         # BraTS-style 标签映射 {0,1,2,3}→{0,1,2,3}
         self.LABEL_MAP = {0: 0, 1: 1, 2: 2, 3: 3}
         self.num_classes = len(self.LABEL_MAP)
@@ -69,19 +68,35 @@ class BaselineUNETRSegmenter:
             in_channels=self.in_channels,
             out_channels=self.num_classes,
             img_size=(128, 128, 128),
-            feature_size=16,
+            feature_size=32,
             hidden_size=768,
             mlp_dim=3072,
             num_heads=12,
-            norm_name="instance",
+            norm_name="instance"
         ).to(self.device)
+
+        # 2) Patch‐Embed 后插入 Dropout
+        #    通常 patch‐embed 在 self.model.vit.patch_embed
+        self.model.vit.patch_embedding = nn.Sequential(
+            self.model.vit.patch_embedding,
+            nn.Dropout(p=0.1)  # 丢弃 10%
+        )
+    
+        # 3) 对每个 Transformer block 注入 DropPath（Stochastic Depth）
+        #    Transformer blocks 列在 self.model.vit.blocks 列表中
+        for blk in self.model.vit.blocks:
+            blk.drop_path = DropPath(0.15)  # 随机丢层 15%
+    
+        # 4) Decoder 侧再用 3D Dropout
+        self.decoder_dropout = nn.Dropout3d(p=0.2)
+
 
         # optimizer + AMP scaler
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.lr)
         # newer API:
         self.scaler = torch.cuda.amp.GradScaler()
 
-    def _get_dataloader(self, data_list, batch_size, shuffle, num_workers):
+    def _get_dataloader(self, data_list, batch_size, shuffle, num_workers, cache_rate):
         transforms = [
             LoadImaged(keys=["image","label"]),
             EnsureChannelFirstd(keys=["image","label"]),
@@ -112,16 +127,18 @@ class BaselineUNETRSegmenter:
                 RandShiftIntensityd(keys=["image"], prob=0.2, offsets=0.10),
             ]
 
-        ds = CacheDataset(data=data_list, transform=transforms)
+        ds = CacheDataset(data=data_list, transform=transforms, cache_rate=cache_rate)
         return DataLoader(
             ds, batch_size=batch_size, shuffle=shuffle,
             num_workers=num_workers, pin_memory=True,
+             persistent_workers=True,
+            prefetch_factor=2,
             collate_fn=pad_list_data_collate
         )
 
     def fit_from_nnunet(self, nnunet_raw: str, task_id: str,
                         epochs: int = 50, batch_size: int = 1,
-                        num_workers: int = 4):
+                        num_workers: int = 4, cache_rate = 0.3):
         ds = Path(nnunet_raw) / f"Dataset{task_id}"
         info = json.load(open(ds / "dataset.json"))
         examples = info["training"]
@@ -144,9 +161,20 @@ class BaselineUNETRSegmenter:
             }
             for ex in val_exs
         ]
-        train_loader = self._get_dataloader(train_data, batch_size, True, num_workers)
-        val_loader   = self._get_dataloader(val_data,   batch_size, False, num_workers)
+        train_loader = self._get_dataloader(train_data, batch_size, True, num_workers, cache_rate)
+        val_loader   = self._get_dataloader(val_data,   batch_size, False, num_workers, cache_rate)
 
+        total_steps = epochs * len(train_loader)
+        self.scheduler = OneCycleLR(
+            self.optimizer,
+            max_lr=self.lr * 10,       # peak LR，通常设为 base_lr 的 5～10 倍
+            total_steps=total_steps,
+            pct_start=0.1,              # 前10%的 steps 线性升到 max_lr
+            anneal_strategy="cos",      # 余弦退火
+            div_factor=25.0,            # 初始 lr = max_lr/div_factor
+            final_div_factor=1e4        # 结束 lr = initial/div_factor/final_div_factor
+        )
+        
         best_val = 0.0
         for ep in range(1, epochs + 1):
             # —— 训练步骤
@@ -162,7 +190,11 @@ class BaselineUNETRSegmenter:
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+                self.scheduler.step() 
                 total_loss += loss.item()
+
+                current_lr = self.scheduler.get_last_lr()[0]
+                print(f"  lr: {current_lr:.2e}")
 
             # —— 验证步骤
             self.model.eval()
@@ -200,7 +232,7 @@ class BaselineUNETRSegmenter:
             return self.model(img.to(self.device))
 
     def evaluate_from_nnunet(self, nnunet_raw: str, task_id: str,
-                             batch_size: int = 1, num_workers: int = 4) -> dict:
+                             batch_size: int = 1, num_workers: int = 4, cache_rate: float = 0.0) -> dict:
         ds = Path(nnunet_raw) / f"Dataset{task_id}"
         info = json.load(open(ds / "dataset.json"))
         test_list = info.get("test", info.get("testing", []))
@@ -234,9 +266,11 @@ class BaselineUNETRSegmenter:
             for ex in test_list
         ]
         loader = DataLoader(
-            CacheDataset(data=data_list, transform=test_transforms),
+            CacheDataset(data=data_list, transform=test_transforms, cache_rate=cache_rate),
             batch_size=batch_size, shuffle=False,
             num_workers=num_workers, pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
             collate_fn=pad_list_data_collate
         )
 
