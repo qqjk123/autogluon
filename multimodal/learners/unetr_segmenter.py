@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-#v2
-
 import os
 import json
 import torch
