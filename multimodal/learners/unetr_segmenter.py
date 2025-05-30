@@ -31,7 +31,7 @@ from monai.networks.layers import DropPath
 from monai.metrics import DiceMetric, HausdorffDistanceMetric
 from monai.inferers import sliding_window_inference
 from monai.networks.utils import one_hot
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
 # 1. cuDNN 自动调优
 torch.backends.cudnn.benchmark = True
 
@@ -45,7 +45,7 @@ class BaselineUNETRSegmenter:
         self.val_split = val_split
         self.in_channels = in_channels
         # BraTS-style 标签映射 {0,1,2,3}→{0,1,2,3}
-        self.LABEL_MAP = {0: 0, 1: 1, 2: 2, 3: 3}
+        self.LABEL_MAP = {0: 0, 1: 1, 2: 2, 4: 3}
         self.num_classes = len(self.LABEL_MAP)
 
         # placeholders，稍后在 _build_model 中初始化
@@ -165,15 +165,8 @@ class BaselineUNETRSegmenter:
         val_loader   = self._get_dataloader(val_data,   batch_size, False, num_workers, cache_rate)
 
         total_steps = epochs * len(train_loader)
-        self.scheduler = OneCycleLR(
-            self.optimizer,
-            max_lr=self.lr * 10,       # peak LR，通常设为 base_lr 的 5～10 倍
-            total_steps=total_steps,
-            pct_start=0.1,              # 前10%的 steps 线性升到 max_lr
-            anneal_strategy="cos",      # 余弦退火
-            div_factor=25.0,            # 初始 lr = max_lr/div_factor
-            final_div_factor=1e4        # 结束 lr = initial/div_factor/final_div_factor
-        )
+        self.scheduler = CosineAnnealingLR(self.optimizer, T_max=epochs, eta_min=1e-6)
+
         
         best_val = 0.0
         for ep in range(1, epochs + 1):
@@ -190,11 +183,7 @@ class BaselineUNETRSegmenter:
                 self.scaler.scale(loss).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
-                self.scheduler.step() 
                 total_loss += loss.item()
-
-                current_lr = self.scheduler.get_last_lr()[0]
-                print(f"  lr: {current_lr:.2e}")
 
             # —— 验证步骤
             self.model.eval()
@@ -217,6 +206,14 @@ class BaselineUNETRSegmenter:
             print(f"[Epoch {ep}/{epochs}] "
                   f"train loss: {total_loss/len(train_loader):.4f} | "
                   f"val Dice: {val_dice:.4f}")
+
+            current_lrs = self.scheduler.get_last_lr()
+            # 通常也是一个长度为 1 的 list
+            print(f"  lr: {current_lrs[0]:.2e}")
+            
+            self.scheduler.step()
+            
+            
             if val_dice > best_val:
                 best_val = val_dice
                 torch.save(self.model.state_dict(),
