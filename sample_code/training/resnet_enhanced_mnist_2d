@@ -1,0 +1,368 @@
+# 2D
+# Dataset 3 - 2D Version
+# v5 (Adapted from v4 for 2D Classification)
+# Resnet - 最终版 (支持 ResNet50/101/18, EfficientNet, Swin Transformer)
+# [修改] 已整合方案一: 使用 Accuracy + AUC 的综合得分来指导验证
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from tqdm import tqdm
+import torch.nn.functional as F
+
+# 导入 MedMNIST 和 MONAI 相关库
+import medmnist
+from medmnist import INFO, Evaluator
+
+from monai.data import list_data_collate
+from monai.transforms import (
+    Compose,
+    ScaleIntensityd,
+    ToTensord,
+    Resized,
+    RandRotate90d,
+    RandAffined,
+    RandFlipd,
+)
+# [新增] 导入 2D 模型
+from monai.networks.nets import ResNet, EfficientNetBN
+from monai.metrics import ROCAUCMetric
+
+# ======================================================================================
+# 1. 配置区域 (可在此切换模型)
+# ======================================================================================
+class Config:
+    # --- 实验与数据配置 ---
+    # 'organsmnist', 'organamnist', 'organamnist', 'dermamnist', 'bloodmnist', etc.
+    DATA_FLAG = 'organsmnist' 
+    IMG_SIZE = (224, 224)
+
+    # --- 模型选择 (在此处修改以切换模型) ---
+    MODEL_NAME = 'ResNet50'          # 选项1: ResNet 基线模型
+    # MODEL_NAME = 'ResNet18'          # 选项2: 更轻量的 ResNet
+    # MODEL_NAME = 'EfficientNet-B4'   # 选项3: 高效的CNN架构 (推荐)
+    # MODEL_NAME = 'SwinTransformer'   # 选项4: 先进的Transformer架构 (推荐)
+    
+    EXPERIMENT_NAME = f"{MODEL_NAME}_{DATA_FLAG}_{IMG_SIZE[0]}px_Final_CombinedMetric" # 为本次实验命名
+    
+    # --- 训练超参数 ---
+    NUM_EPOCHS = 30
+    BATCH_SIZE = 64 # 根据显存大小调整, 224x224 图像需要更多显存
+    LEARNING_RATE = 1e-4 # 对于大模型和更大的图像，稍小的学习率可能更稳定
+    WEIGHT_DECAY = 1e-5
+    
+    # --- 硬件与效率配置 ---
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    NUM_WORKERS = 8 # 根据您的系统配置调整
+    USE_AMP = True
+    
+    # --- 模型保存 ---
+    MODEL_SAVE_DIR = "./saved_models_2d"
+
+# ======================================================================================
+# 2. 辅助函数 (数据加载和模型定义)
+# ======================================================================================
+class MedMNIST2DWrapper(Dataset):
+    """用于将 MedMNIST 数据集包装成 MONAI 兼容格式的辅助类"""
+    def __init__(self, medmnist_dataset, transform):
+        self.medmnist_dataset = medmnist_dataset
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.medmnist_dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.medmnist_dataset[idx]
+        # MedMNIST 2D 数据已经是 (H, W, C) 或 (H, W)，MONAI 需要 (C, H, W)
+        # np.transpose 会处理这个问题
+        data = {'image': np.transpose(image, (2, 0, 1)), 'label': label}
+        if self.transform:
+            data = self.transform(data)
+        return data
+
+def get_data_loaders(config):
+    """准备并返回训练和验证数据加载器"""
+    print(f"准备数据集: {config.DATA_FLAG}...")
+    info = INFO[config.DATA_FLAG]
+    # 使用正确的 MedMNIST 数据集类
+    DataClass = getattr(medmnist, info['python_class'])
+    
+    target_spatial_size = config.IMG_SIZE
+
+    # 2D 训练数据增强
+    train_transforms = Compose([
+        ScaleIntensityd(keys="image"),
+        Resized(keys="image", spatial_size=target_spatial_size, mode="bilinear", align_corners=False),
+        RandFlipd(keys="image", spatial_axis=[0, 1], prob=0.5), # 2D 翻转
+        RandRotate90d(keys="image", prob=0.5, max_k=3),
+        RandAffined(
+            keys='image', mode='bilinear', prob=0.8, spatial_size=target_spatial_size,
+            rotate_range=(np.pi / 18, np.pi / 18), # 2D 旋转
+            scale_range=(0.2, 0.2), padding_mode='border'
+        ),
+        ToTensord(keys=["image", "label"], track_meta=False),
+    ])
+
+    # 2D 验证/测试数据变换
+    val_test_transforms = Compose([
+        ScaleIntensityd(keys="image"),
+        Resized(keys="image", spatial_size=target_spatial_size, mode="bilinear", align_corners=False),
+        ToTensord(keys=["image", "label"], track_meta=False),
+    ])
+
+    # 下载并包装数据集
+    train_dataset_raw = DataClass(split='train', download=True)
+    train_ds = MedMNIST2DWrapper(train_dataset_raw, train_transforms)
+    
+    val_dataset_raw = DataClass(split='val', download=True)
+    val_ds = MedMNIST2DWrapper(val_dataset_raw, val_test_transforms)
+
+    # 创建 DataLoader
+    train_loader = DataLoader(
+        train_ds, batch_size=config.BATCH_SIZE, shuffle=True,  
+        num_workers=config.NUM_WORKERS, collate_fn=list_data_collate, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=config.BATCH_SIZE, shuffle=False,  
+        num_workers=config.NUM_WORKERS, collate_fn=list_data_collate, pin_memory=True
+    )
+    
+    print(f"数据加载完成. 任务: {info['task']}, 类别数: {len(info['label'])}, 输入通道: {info['n_channels']}")
+    return train_loader, val_loader, info
+
+def get_model(config, info):
+    """根据配置初始化并返回模型"""
+    model_name, num_classes = config.MODEL_NAME, len(info['label'])
+    print(f"初始化模型: {model_name}...")
+    in_channels = info['n_channels']
+    
+    # [核心修改] 所有模型的 `spatial_dims` 都设置为 2
+    if model_name == 'ResNet18':
+        model = ResNet(layers=[2, 2, 2, 2], block='basic',
+                       n_input_channels=in_channels, num_classes=num_classes, spatial_dims=2)
+    
+    elif model_name == 'ResNet50':
+        model = ResNet(layers=[3, 4, 6, 3], block='bottleneck',
+                       n_input_channels=in_channels, num_classes=num_classes, spatial_dims=2)
+    
+    elif model_name == 'ResNet101':
+        model = ResNet(layers=[3, 4, 23, 3], block='bottleneck',
+                       n_input_channels=in_channels, num_classes=num_classes, spatial_dims=2)
+
+    elif model_name.startswith('EfficientNet'):
+        model = EfficientNetBN(model_name=model_name.lower(), pretrained=False,
+                               spatial_dims=2, in_channels=in_channels, num_classes=num_classes)
+        
+    elif model_name == 'SwinTransformer':
+        model = SwinTransformer(
+            in_chans=in_channels,
+            num_classes=num_classes,
+            img_size=config.IMG_SIZE, # 2D image size
+            patch_size=(4, 4),        # 2D patch size
+            window_size=(7, 7),       # 2D window size for 224x224
+            depths=[2, 2, 6, 2],      # Swin-T (Tiny) config
+            num_heads=[3, 6, 12, 24],
+            use_v2=False,
+        )
+
+    else:
+        raise ValueError(f"模型 '{model_name}' 不被支持.")
+        
+    return model.to(config.DEVICE)
+
+
+# ======================================================================================
+# 3. 训练与评估模块
+# ======================================================================================
+def run_training(config, model, train_loader, val_loader, info):
+    """执行完整的训练和验证流程"""
+    task = info['task']
+    device = config.DEVICE
+
+    loss_function = nn.CrossEntropyLoss() if 'multi-label' not in task else nn.BCEWithLogitsLoss()
+    print(f"任务为 {task}, 使用 {loss_function.__class__.__name__}. 主要评估指标: Combined Score (AUC + Accuracy).")
+        
+    optimizer = optim.AdamW(model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.NUM_EPOCHS, eta_min=1e-6)
+    scaler = torch.cuda.amp.GradScaler(enabled=config.USE_AMP)
+    
+    # best_metric 现在将存储最佳的 "综合得分"
+    best_metric, best_metric_epoch = -1, -1
+    
+    print(f"\n--- 开始训练: {config.EXPERIMENT_NAME} ---")
+    for epoch in range(config.NUM_EPOCHS):
+        model.train()
+        epoch_loss = 0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS} [训练]", unit="batch")
+        for batch_data in progress_bar:
+            inputs, labels = batch_data["image"].to(device, non_blocking=True), batch_data["label"].to(device, non_blocking=True)
+            optimizer.zero_grad()
+            
+            with torch.cuda.amp.autocast(enabled=config.USE_AMP):
+                outputs = model(inputs)
+                if isinstance(loss_function, nn.CrossEntropyLoss):
+                    labels = labels.squeeze(1).long()
+                else:  
+                    labels = labels.float()
+                loss = loss_function(outputs, labels)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            epoch_loss += loss.item()
+            progress_bar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.6f}"})
+        
+        scheduler.step()
+        print(f"Epoch {epoch + 1} 平均训练损失: {epoch_loss / len(train_loader):.4f}")
+
+        # --- 验证逻辑 ---
+        model.eval()
+        auc_metric = ROCAUCMetric()
+        all_val_outputs, all_val_labels = [], []
+        with torch.no_grad():
+            for val_data in tqdm(val_loader, desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS} [验证]", unit="batch"):
+                val_images = val_data["image"].to(device, non_blocking=True)
+                val_labels = val_data["label"].to(device, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=config.USE_AMP):
+                    val_outputs = model(val_images)
+                all_val_outputs.append(val_outputs)
+                all_val_labels.append(val_labels)
+
+        all_val_outputs = torch.cat(all_val_outputs, dim=0)
+        all_val_labels = torch.cat(all_val_labels, dim=0)
+
+        # 计算 Accuracy 和 AUC
+        if 'multi-label' in task:
+            val_probs = torch.sigmoid(all_val_outputs)
+            auc_metric(y_pred=val_probs, y=all_val_labels.long())
+            preds_class = val_probs > 0.5
+            acc_result = (preds_class == all_val_labels.bool()).sum().item() / all_val_labels.numel()
+        else: # 多分类
+            val_probs = torch.softmax(all_val_outputs, dim=1)
+            val_labels_1d = all_val_labels.squeeze(1).long()
+            num_classes = val_probs.shape[1]
+            val_labels_onehot = F.one_hot(val_labels_1d, num_classes=num_classes).float()
+            
+            y_pred_classes = torch.argmax(all_val_outputs, dim=1)
+            correct = (y_pred_classes == val_labels_1d).sum().item()
+            acc_result = correct / val_labels_1d.numel()
+            auc_metric(y_pred=val_probs, y=val_labels_onehot)
+            
+        auc_result = auc_metric.aggregate().item()
+
+        # ======================= [核心修改] =======================
+        # 1. 计算综合得分 (简单相加)
+        combined_score = acc_result + auc_result
+
+        print(f"Epoch {epoch + 1} 验证 -> AUC: {auc_result:.4f}, Accuracy: {acc_result:.4f}, Combined Score: {combined_score:.4f}")
+
+        # 2. 使用 "Combined Score" 来判断和保存最佳模型
+        if combined_score > best_metric:
+            best_metric, best_metric_epoch = combined_score, epoch + 1
+            os.makedirs(config.MODEL_SAVE_DIR, exist_ok=True)
+            save_path = os.path.join(config.MODEL_SAVE_DIR, f"best_{config.EXPERIMENT_NAME}.pth")
+            torch.save(model.state_dict(), save_path)
+            # 3. 更新提示信息
+            print(f"🎉 新的最佳模型! (基于 Combined Score) 已保存到: {save_path}")
+        # ==========================================================
+
+    print(f"--- 训练完成 ---")
+    print(f"最佳验证 Combined Score: {best_metric:.4f} (在 Epoch {best_metric_epoch})")
+
+# ======================================================================================
+# 4. Test 集评估
+# ======================================================================================
+@torch.no_grad()
+def evaluate_on_test(config, info):
+    """在测试集上评估最终保存的最佳模型"""
+    print("\n========== 开始 Test 评估 ==========")
+    
+    device = config.DEVICE
+    
+    # 准备测试数据加载器
+    test_transforms = Compose([
+        ScaleIntensityd(keys="image"),
+        Resized(keys="image", spatial_size=config.IMG_SIZE, mode="bilinear", align_corners=False),
+        ToTensord(keys=["image", "label"], track_meta=False),
+    ])
+
+    DataClass = getattr(medmnist, info['python_class'])
+    test_dataset_raw = DataClass(split="test", download=True)
+    test_ds = MedMNIST2DWrapper(test_dataset_raw, test_transforms)
+
+    test_loader = DataLoader(
+        test_ds, batch_size=config.BATCH_SIZE, shuffle=False,
+        num_workers=config.NUM_WORKERS, collate_fn=list_data_collate, pin_memory=True
+    )
+
+    # 加载最佳模型
+    model = get_model(config, info)
+    best_ckpt_path = os.path.join(config.MODEL_SAVE_DIR, f"best_{config.EXPERIMENT_NAME}.pth")
+    
+    if not os.path.exists(best_ckpt_path):
+        print(f"错误：找不到训练好的模型权重 '{best_ckpt_path}'。请先完成训练。")
+        return
+
+    model.load_state_dict(torch.load(best_ckpt_path, map_location=device))
+    model.eval()
+
+    # 在测试集上进行推断
+    y_true = torch.tensor([], dtype=torch.long, device=device)
+    y_score = torch.tensor([], device=device)
+
+    for batch in tqdm(test_loader, desc="Test 推断", unit="batch"):
+        images = batch["image"].to(device, non_blocking=True)
+        labels = batch["label"].to(device, non_blocking=True)
+        with torch.cuda.amp.autocast(enabled=config.USE_AMP):
+            outputs = model(images)
+
+        y_true = torch.cat((y_true, labels), 0)
+        y_score = torch.cat((y_score, outputs), 0)
+    
+    # 使用 MedMNIST 的 Evaluator 计算官方指标
+    y_true = y_true.squeeze().cpu().numpy()
+    
+    if 'multi-label' in info['task']:
+        y_score = torch.sigmoid(y_score).cpu().numpy()
+    else: # multi-class
+        y_score = torch.softmax(y_score, dim=-1).cpu().numpy()
+        
+    evaluator = Evaluator(config.DATA_FLAG, 'test')
+    metrics = evaluator.evaluate(y_score)
+    
+    acc = metrics['acc']
+    auc = metrics['auc']
+
+    print(f"\n✅ Test 结果 ({config.EXPERIMENT_NAME}) → ACC: {acc:.4f} | AUC: {auc:.4f}")
+    print("=====================================")
+
+
+# ======================================================================================
+# 5. 主执行函数
+# ======================================================================================
+def main():
+    """主函数，编排整个流程"""
+    config = Config()
+    print("="*60)
+    print(f"配置: Dataset={config.DATA_FLAG}, Model={config.MODEL_NAME}, Device={config.DEVICE}")
+    print(f"实验名称: {config.EXPERIMENT_NAME}")
+    print(f"超参数: Epochs={config.NUM_EPOCHS}, Batch Size={config.BATCH_SIZE}, LR={config.LEARNING_RATE}, AMP={'启用' if config.USE_AMP else '禁用'}")
+    print("="*60 + "\n")
+
+    # 开始训练
+    train_loader, val_loader, info = get_data_loaders(config)
+    model = get_model(config, info)
+    run_training(config, model, train_loader, val_loader, info)
+    
+    # 训练结束后，自动在测试集上评估
+    evaluate_on_test(config, info)
+    
+    print("\n所有任务完成!")
+
+if __name__ == "__main__":
+    # 设置环境变量以允许多个OpenMP运行时，避免潜在的库冲突
+    os.environ['KMP_DUPLICATE_LIB_OK']='TRUE'
+    main()
